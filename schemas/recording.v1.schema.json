@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "train-gap://schemas/recording.v1.schema.json",
   "title": "Train-Gap Recording v1 (NDJSON events)",
-  "$comment": "One JSON object per line. t_ms is milliseconds since session start. Samples are written when their probe finishes, so they can appear out of t_ms order. station_depart, station_arrive, and undo come only from recorder builds before 2026-10; current builds write motion and mark instead and record the end station in session_end.",
+  "$comment": "One JSON object per line. t_ms is milliseconds since session start, on a clock that keeps counting while the phone sleeps, so time asleep shows as a gap. Samples are written when their probe finishes, so they can appear out of t_ms order. station_depart, station_arrive, and undo come only from recorder builds before 2026-10; current builds write motion and mark instead and record the end station in session_end.",
   "type": "object",
   "oneOf": [
     { "$ref": "#/$defs/session_start" },
@@ -41,6 +41,20 @@
         "sample_interval_at_station_ms": { "type": "integer", "minimum": 100, "maximum": 60000 },
         "carrier": { "type": "string", "$comment": "Chosen by the rider. iOS no longer reports the carrier name." },
         "motion_hz": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "route_stations": {
+          "$comment": "Stations in ride order, from the start station to the terminal. Stop labels come from it, so the recording can be processed without the app's station dataset.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "name"],
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        },
         "lines_dataset": {
           "type": "object",
           "properties": {

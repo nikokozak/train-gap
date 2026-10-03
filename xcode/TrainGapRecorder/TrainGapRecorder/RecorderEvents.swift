@@ -31,6 +31,9 @@ struct RecorderSessionStart: Codable {
     var sampleIntervalMS: Int?
     var carrier: String?
     var motionHz: Int?
+    /// Stations in ride order, from the start station to the terminal. Stop labels come from it,
+    /// so a recording can be processed without the app's station dataset.
+    var routeStations: [RouteStation]?
     var linesDataset: LinesDatasetInfo?
     var device: DeviceInfo
 
@@ -54,9 +57,15 @@ struct RecorderSessionStart: Codable {
         case sampleIntervalMS = "sample_interval_ms"
         case carrier
         case motionHz = "motion_hz"
+        case routeStations = "route_stations"
         case linesDataset = "lines_dataset"
         case device
     }
+}
+
+struct RouteStation: Codable {
+    var id: String
+    var name: String
 }
 
 struct LinesDatasetInfo: Codable {

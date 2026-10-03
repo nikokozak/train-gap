@@ -41,8 +41,8 @@ final class Recorder: ObservableObject {
     @Published private(set) var probeOKCount = 0
     @Published private(set) var markCount = 0
     @Published private(set) var lastSample: RecorderSample?
-    /// Uptime when the last sample reached the file. The UI shows "saved N s ago" from it.
-    @Published private(set) var lastSavedSampleUptime: TimeInterval?
+    /// `clockSeconds()` when the last sample reached the file. The UI shows "saved N s ago" from it.
+    @Published private(set) var lastSavedSampleTime: TimeInterval?
     /// Accelerometer readings in the last one-second batch. 0 means motion is not being recorded.
     @Published private(set) var motionReadingsPerSecond = 0
     @Published private(set) var isMotionAvailable = true
@@ -59,10 +59,9 @@ final class Recorder: ObservableObject {
 
     /// Nil when no session is open. In-flight probes check it before they write.
     private var writer: NDJSONWriter?
-    /// All event times (`t_ms`) count from here. System uptime is monotonic and is the same
-    /// clock that CoreMotion uses for its timestamps.
-    private var sessionStartUptime: TimeInterval = 0
-    private var stopTappedUptime: TimeInterval?
+    /// All event times (`t_ms`) count from here, on `clockSeconds()`.
+    private var sessionStartTime: TimeInterval = 0
+    private var stopTappedTime: TimeInterval?
     private var tickLoopTask: Task<Void, Never>?
 
     private let pathMonitorQueue = DispatchQueue(label: "TrainGapRecorder.NWPathMonitor")
@@ -76,7 +75,7 @@ final class Recorder: ObservableObject {
     private let telephonyInfo = CTTelephonyNetworkInfo()
 
     private struct ProbeBackoffState {
-        var untilUptime: TimeInterval
+        var backoffUntilTime: TimeInterval
         var strikes: Int
     }
 
@@ -101,13 +100,13 @@ final class Recorder: ObservableObject {
 
         let sessionID = UUID().uuidString.lowercased()
         let startDate = Date()
-        sessionStartUptime = ProcessInfo.processInfo.systemUptime
+        sessionStartTime = Self.clockSeconds()
         let fileURL = Self.sessionFileURL(sessionID: sessionID, startedAt: startDate, config: config)
 
         do {
             let newWriter = try NDJSONWriter(fileURL: fileURL)
             writer = newWriter
-            try await newWriter.append(makeSessionStartEvent(sessionID: sessionID, startedAt: startDate, config: config))
+            try await newWriter.append(makeSessionStartEvent(sessionID: sessionID, startedAt: startDate, line: line, config: config))
         } catch {
             writer = nil
             errorMessage = "Could not create the session file: \(error.localizedDescription)"
@@ -117,12 +116,12 @@ final class Recorder: ObservableObject {
         self.line = line
         self.config = config
         startedAt = startDate
-        stopTappedUptime = nil
+        stopTappedTime = nil
         sampleCount = 0
         probeOKCount = 0
         markCount = 0
         lastSample = nil
-        lastSavedSampleUptime = nil
+        lastSavedSampleTime = nil
         motionReadingsPerSecond = 0
         probeCursor = 0
         probeBackoff = [:]
@@ -150,11 +149,11 @@ final class Recorder: ObservableObject {
 
     /// Remembers when the rider tapped Stop. Recording continues until `finish` or `cancelStop`.
     func noteStopTapped() {
-        stopTappedUptime = ProcessInfo.processInfo.systemUptime
+        stopTappedTime = Self.clockSeconds()
     }
 
     func cancelStop() {
-        stopTappedUptime = nil
+        stopTappedTime = nil
     }
 
     /// Ends the session. `endStationIndex` is nil when the rider is not sure where they got off.
@@ -171,15 +170,15 @@ final class Recorder: ObservableObject {
         tickLoopTask = nil
         UIApplication.shared.isIdleTimerDisabled = false
 
-        let nowUptime = ProcessInfo.processInfo.systemUptime
-        let endUptime = stopTappedUptime ?? nowUptime
+        let nowTime = Self.clockSeconds()
+        let endTime = stopTappedTime ?? nowTime
         var endStation: Station?
         if let endStationIndex, let line, line.stations.indices.contains(endStationIndex) {
             endStation = line.stations[endStationIndex]
         }
         let endEvent = RecorderSessionEnd(
-            tMS: tMS(atUptime: endUptime),
-            endedAt: iso8601String(Date().addingTimeInterval(endUptime - nowUptime)),
+            tMS: tMS(atTime: endTime),
+            endedAt: iso8601String(Date().addingTimeInterval(endTime - nowTime)),
             reason: "user_stop",
             endStationID: endStation?.id,
             endStationName: endStation?.shortName,
@@ -197,24 +196,24 @@ final class Recorder: ObservableObject {
             errorMessage = "Could not save the end of the ride (\(error.localizedDescription)). The samples are saved."
         }
         await finishingWriter.close()
-        stopTappedUptime = nil
+        stopTappedTime = nil
     }
 
     // MARK: - Tick loop
 
     /// Runs `tick()` every `tickInterval` on a fixed schedule until recording stops.
     private func runTickLoop() async {
-        var nextTickUptime = ProcessInfo.processInfo.systemUptime
+        var nextTickTime = Self.clockSeconds()
         while isRecording && !Task.isCancelled {
             tick()
-            nextTickUptime += Self.tickInterval
-            let delay = nextTickUptime - ProcessInfo.processInfo.systemUptime
+            nextTickTime += Self.tickInterval
+            let delay = nextTickTime - Self.clockSeconds()
             if delay > 0 {
                 try? await Task.sleep(for: .seconds(delay))
             } else {
                 // We fell behind, for example because iOS paused the app. Skip the missed
                 // ticks instead of bursting; the gap shows in the file as missing samples.
-                nextTickUptime = ProcessInfo.processInfo.systemUptime
+                nextTickTime = Self.clockSeconds()
             }
         }
     }
@@ -263,7 +262,7 @@ final class Recorder: ObservableObject {
                 probeOKCount += 1
             }
             lastSample = sample
-            lastSavedSampleUptime = ProcessInfo.processInfo.systemUptime
+            lastSavedSampleTime = Self.clockSeconds()
         }
     }
 
@@ -274,9 +273,9 @@ final class Recorder: ObservableObject {
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
 
         let reuseObserver = ConnectionReuseObserver()
-        let startUptime = ProcessInfo.processInfo.systemUptime
+        let probeStartTime = Self.clockSeconds()
         func elapsedMilliseconds() -> Int {
-            max(0, Int(((ProcessInfo.processInfo.systemUptime - startUptime) * 1000).rounded()))
+            max(0, Int(((Self.clockSeconds() - probeStartTime) * 1000).rounded()))
         }
 
         do {
@@ -314,12 +313,12 @@ final class Recorder: ObservableObject {
 
     private func nextProbeURL() -> URL {
         let urls = config?.probeURLs ?? Self.defaultProbeURLs
-        let nowUptime = ProcessInfo.processInfo.systemUptime
+        let nowTime = Self.clockSeconds()
 
         for _ in 0..<urls.count {
             let url = urls[probeCursor % urls.count]
             probeCursor += 1
-            if nowUptime >= (probeBackoff[url]?.untilUptime ?? 0) {
+            if nowTime >= (probeBackoff[url]?.backoffUntilTime ?? 0) {
                 return url
             }
         }
@@ -332,15 +331,15 @@ final class Recorder: ObservableObject {
 
     /// Exponential backoff after HTTP 429: 15 s, 30 s, 60 s, ... up to 5 minutes, plus jitter.
     private func noteRateLimit(for url: URL) {
-        let nowUptime = ProcessInfo.processInfo.systemUptime
-        var state = probeBackoff[url] ?? ProbeBackoffState(untilUptime: 0, strikes: 0)
+        let nowTime = Self.clockSeconds()
+        var state = probeBackoff[url] ?? ProbeBackoffState(backoffUntilTime: 0, strikes: 0)
         state.strikes += 1
 
         let baseDelay = 15.0
         let maximumDelay = 300.0
         let delay = min(maximumDelay, baseDelay * pow(2.0, Double(state.strikes - 1)))
         let jitter = Double.random(in: 0...min(5.0, delay * 0.1))
-        state.untilUptime = nowUptime + delay + jitter
+        state.backoffUntilTime = nowTime + delay + jitter
         probeBackoff[url] = state
     }
 
@@ -413,8 +412,11 @@ final class Recorder: ObservableObject {
         motionManager.deviceMotionUpdateInterval = 1.0 / Double(Self.motionHz)
         motionManager.startDeviceMotionUpdates(to: .main) { [weak self] motion, _ in
             guard let motion else { return }
+            // CoreMotion timestamps use system uptime, which stops while the phone sleeps.
+            // A reading arrives milliseconds after it is taken, so convert it to our clock now.
+            let readingTime = Self.clockSeconds() - (ProcessInfo.processInfo.systemUptime - motion.timestamp)
             // Delivered on the main queue, so main-actor state is safe to change here.
-            MainActor.assumeIsolated { self?.motionBatch.add(motion) }
+            MainActor.assumeIsolated { self?.motionBatch.add(motion, readingTime: readingTime) }
         }
     }
 
@@ -423,10 +425,10 @@ final class Recorder: ObservableObject {
         let batch = motionBatch
         motionBatch = MotionBatch()
         motionReadingsPerSecond = batch.xMilliG.count
-        guard let firstReadingUptime = batch.firstReadingUptime else { return nil }
+        guard let firstReadingTime = batch.firstReadingTime else { return nil }
 
         return RecorderMotion(
-            tMS: tMS(atUptime: firstReadingUptime),
+            tMS: tMS(atTime: firstReadingTime),
             hz: Self.motionHz,
             xMilliG: batch.xMilliG,
             yMilliG: batch.yMilliG,
@@ -459,12 +461,19 @@ final class Recorder: ObservableObject {
 
     // MARK: - Time
 
-    private func nowTMS() -> Int {
-        tMS(atUptime: ProcessInfo.processInfo.systemUptime)
+    /// Seconds on a clock that keeps counting while the phone sleeps. Every event time uses it,
+    /// so time spent asleep shows up in the recording as a gap. System uptime (and CoreMotion's
+    /// timestamps) stop during sleep, which would make that time silently disappear.
+    nonisolated static func clockSeconds() -> TimeInterval {
+        Double(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)) / 1_000_000_000
     }
 
-    private func tMS(atUptime uptime: TimeInterval) -> Int {
-        max(0, Int(((uptime - sessionStartUptime) * 1000).rounded()))
+    private func nowTMS() -> Int {
+        tMS(atTime: Self.clockSeconds())
+    }
+
+    private func tMS(atTime time: TimeInterval) -> Int {
+        max(0, Int(((time - sessionStartTime) * 1000).rounded()))
     }
 
     // MARK: - Session file
@@ -483,7 +492,7 @@ final class Recorder: ObservableObject {
         return sessionsDirectoryURL().appendingPathComponent(fileName)
     }
 
-    private func makeSessionStartEvent(sessionID: String, startedAt: Date, config: SessionConfig) -> RecorderSessionStart {
+    private func makeSessionStartEvent(sessionID: String, startedAt: Date, line: Line, config: SessionConfig) -> RecorderSessionStart {
         let device = DeviceInfo(
             model: UIDevice.current.model,
             systemName: UIDevice.current.systemName,
@@ -491,6 +500,8 @@ final class Recorder: ObservableObject {
         )
         let dataset = LinesDatasetInfo(source: "bundle:lines.json", generatedAt: nil, sha256: bundledLinesJSONSHA256())
         let probeURLs = config.probeURLs.map(\.absoluteString)
+        let routeIndices = [config.startStationIndex] + line.stationIndicesAfter(config.startStationIndex, direction: config.direction)
+        let routeStations = routeIndices.map { RouteStation(id: line.stations[$0].id, name: line.stations[$0].shortName) }
 
         return RecorderSessionStart(
             sessionID: sessionID,
@@ -511,6 +522,7 @@ final class Recorder: ObservableObject {
             carrier: config.carrier,
             // Ask the sensor directly: this event is written before motion updates start.
             motionHz: motionManager.isDeviceMotionAvailable ? Self.motionHz : nil,
+            routeStations: routeStations,
             linesDataset: dataset,
             device: device
         )
@@ -532,7 +544,7 @@ final class Recorder: ObservableObject {
 
 /// Accelerometer readings collected between two ticks.
 private struct MotionBatch {
-    var firstReadingUptime: TimeInterval?
+    var firstReadingTime: TimeInterval?
     var xMilliG: [Int] = []
     var yMilliG: [Int] = []
     var zMilliG: [Int] = []
@@ -540,9 +552,10 @@ private struct MotionBatch {
     var gravitySumY = 0.0
     var gravitySumZ = 0.0
 
-    mutating func add(_ motion: CMDeviceMotion) {
-        if firstReadingUptime == nil {
-            firstReadingUptime = motion.timestamp  // Seconds since boot: the same clock as systemUptime.
+    /// `readingTime` is when the reading was taken, on `Recorder.clockSeconds()`.
+    mutating func add(_ motion: CMDeviceMotion, readingTime: TimeInterval) {
+        if firstReadingTime == nil {
+            firstReadingTime = readingTime
         }
         xMilliG.append(Self.milliG(motion.userAcceleration.x))
         yMilliG.append(Self.milliG(motion.userAcceleration.y))

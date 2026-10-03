@@ -145,7 +145,7 @@ struct RideRecordingView: View {
     }
 
     private var sampleAge: TimeInterval? {
-        recorder.lastSavedSampleUptime.map { ProcessInfo.processInfo.systemUptime - $0 }
+        recorder.lastSavedSampleTime.map { Recorder.clockSeconds() - $0 }
     }
 
     private var sampleAgeText: String {

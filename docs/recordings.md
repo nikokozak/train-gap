@@ -28,8 +28,8 @@ In the recorder app:
 
 ## What’s in the NDJSON
 
-One event per line. `t_ms` is milliseconds since the session started.
-- `session_start`: route, start station, carrier, probe URLs, motion rate
+One event per line. `t_ms` is milliseconds since the session started. The clock keeps counting while the phone sleeps, so time the app did not run shows as a gap in the data.
+- `session_start`: route, start station, the stations in ride order (`route_stations`), carrier, probe URLs, motion rate
 - `sample`: one network probe per second, plus network path and radio type (LTE, NR)
 - `motion`: one second of accelerometer readings (20 Hz, milli-g, gravity removed)
 - `mark`: the rider tapped Mark
@@ -53,19 +53,45 @@ Each `sample` includes an HTTP probe:
 go run ./cmd/recording-summarize -- path/to/session.ndjson
 ```
 
-JSON output:
+JSON output (segments and stops with times and probe statistics):
 
 ```bash
 go run ./cmd/recording-summarize --json -- path/to/session.ndjson
 ```
 
+### How stops are found
+
+For current recordings, the summarizer finds the stops in the motion trace:
+1) Each one-second motion batch becomes one number: RMS acceleration (milli-g).
+2) A 5-second rolling median removes single jolts.
+3) Each second is **still**, **moving** (train), or **walking**. Motion after the Stop tap is ignored.
+4) Moving runs are joined across short pauses. Runs shorter than a ride between stations are dropped.
+5) The start and end stations give the expected number of segments.
+
+The result is in `stop_detection.status`:
+- `matched`: the count is correct. Segments and stops are labelled.
+- `matched_after_removing_holds`: correct after removing stops with no cell service. Underground stations have service, so such a stop is probably a train held in a tunnel.
+- `unverified_end`: you chose "Not sure". Labels count forward from the start station.
+- `count_mismatch`: no labels. Review the stops, or tune the thresholds.
+- `no_motion`: the recording has no motion data.
+
+### Tuning the thresholds (calibration ride)
+
+The default thresholds are estimates. On a calibration ride, tap **Mark** at every stop, then:
+
+```bash
+go run ./cmd/recording-summarize -energy -- path/to/session.ndjson > energy.csv
+```
+
+Each row is one second: RMS, smoothed RMS, state, and `mark=1` where you tapped Mark. Rows with a mark must be `still`. Set the flags from what you see, and check that the summary reports every mark inside a detected stop:
+
+```bash
+go run ./cmd/recording-summarize -moving-mg 30 -walking-mg 250 -min-stop-s 8 -min-segment-s 20 -- path/to/session.ndjson
+```
+
 ## Next processing step (how Train-Gap can use it)
 
-The most direct mapping into Train-Gap is:
-- derive an empirical “blackout” probability and RTT distribution per segment/time window
-- use it to tune `internal/sim/train.go` (packet loss + latency profiles)
-
-Once stops are labelled (from the motion trace and the start and end stations), samples can be grouped by segment to make per-segment connectivity profiles. Stop detection is not built yet; until then, `recording-summarize` reports segments only for recordings with the old depart/arrive markers.
+The labelled segments and stops, with their probe statistics, become a timeline that the simulator replays: per segment, the share of successful probes and the round-trip times of the successful ones.
 
 ## Keeping the Go simulator in sync with the iPhone route dataset (optional)
 
