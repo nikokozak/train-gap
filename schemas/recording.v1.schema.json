@@ -1,0 +1,215 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "train-gap://schemas/recording.v1.schema.json",
+  "title": "Train-Gap Recording v1 (NDJSON events)",
+  "$comment": "One JSON object per line. t_ms is milliseconds since session start. Samples are written when their probe finishes, so they can appear out of t_ms order. station_depart, station_arrive, and undo come only from recorder builds before 2026-10; current builds write motion and mark instead and record the end station in session_end.",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/session_start" },
+    { "$ref": "#/$defs/station_depart" },
+    { "$ref": "#/$defs/station_arrive" },
+    { "$ref": "#/$defs/undo" },
+    { "$ref": "#/$defs/sample" },
+    { "$ref": "#/$defs/motion" },
+    { "$ref": "#/$defs/mark" },
+    { "$ref": "#/$defs/session_end" }
+  ],
+  "$defs": {
+    "session_start": {
+      "type": "object",
+      "required": ["type", "v", "session_id", "started_at", "line_id", "from_station_id"],
+      "properties": {
+        "type": { "const": "session_start" },
+        "v": { "const": 1 },
+        "session_id": { "type": "string" },
+        "started_at": { "type": "string", "format": "date-time" },
+        "ended_at": { "type": "string", "format": "date-time" },
+        "line_id": { "type": "string" },
+        "line_name": { "type": "string" },
+        "from_station_id": { "type": "string" },
+        "from_station_name": { "type": "string" },
+        "to_station_id": { "type": "string" },
+        "to_station_name": { "type": "string" },
+        "direction": { "type": "string", "enum": ["forward", "backward", "unknown"] },
+        "direction_label": { "type": "string" },
+        "direction_terminal_station_id": { "type": "string" },
+        "direction_terminal_station_name": { "type": "string" },
+        "probe_url": { "type": "string", "format": "uri" },
+        "probe_urls": { "type": "array", "items": { "type": "string", "format": "uri" }, "minItems": 1 },
+        "sample_interval_ms": { "type": "integer", "minimum": 100, "maximum": 60000 },
+        "sample_interval_in_transit_ms": { "type": "integer", "minimum": 100, "maximum": 60000 },
+        "sample_interval_at_station_ms": { "type": "integer", "minimum": 100, "maximum": 60000 },
+        "carrier": { "type": "string", "$comment": "Chosen by the rider. iOS no longer reports the carrier name." },
+        "motion_hz": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "lines_dataset": {
+          "type": "object",
+          "properties": {
+            "source": { "type": "string" },
+            "generated_at": { "type": "string", "format": "date-time" },
+            "sha256": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        "device": {
+          "type": "object",
+          "properties": {
+            "model": { "type": "string" },
+            "system_name": { "type": "string" },
+            "system_version": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        "app": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "build": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "marker_common": {
+      "type": "object",
+      "required": ["t_ms"],
+      "properties": {
+        "t_ms": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "station_depart": {
+      "allOf": [
+        { "$ref": "#/$defs/marker_common" },
+        {
+          "type": "object",
+          "required": ["type", "t_ms", "station_id", "station_name", "next_station_id", "next_station_name"],
+          "properties": {
+            "type": { "const": "station_depart" },
+            "station_id": { "type": "string" },
+            "station_name": { "type": "string" },
+            "station_index": { "type": "integer", "minimum": 0 },
+            "next_station_id": { "type": "string" },
+            "next_station_name": { "type": "string" },
+            "next_station_index": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "station_arrive": {
+      "allOf": [
+        { "$ref": "#/$defs/marker_common" },
+        {
+          "type": "object",
+          "required": ["type", "t_ms", "station_id", "station_name"],
+          "properties": {
+            "type": { "const": "station_arrive" },
+            "station_id": { "type": "string" },
+            "station_name": { "type": "string" },
+            "station_index": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "undo": {
+      "allOf": [
+        { "$ref": "#/$defs/marker_common" },
+        {
+          "type": "object",
+          "required": ["type", "t_ms"],
+          "properties": {
+            "type": { "const": "undo" },
+            "count": { "type": "integer", "minimum": 1, "maximum": 10 }
+          }
+        }
+      ]
+    },
+    "path": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": { "type": "string", "enum": ["satisfied", "unsatisfied", "requires_connection", "unknown"] },
+        "interface": { "type": ["string", "null"], "enum": ["wifi", "cellular", "wired", "loopback", "other", null] },
+        "expensive": { "type": "boolean" },
+        "constrained": { "type": "boolean" },
+        "radio": { "type": "string", "$comment": "Cellular radio type for the data SIM, e.g. LTE, NR, NRNSA. Absent when iOS does not report it." }
+      },
+      "additionalProperties": false
+    },
+    "probe": {
+      "type": "object",
+      "required": ["ok"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "url": { "type": ["string", "null"], "format": "uri" },
+        "rtt_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "http_status": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 },
+        "error": { "type": ["string", "null"] },
+        "reused_connection": { "type": "boolean", "$comment": "false means rtt_ms includes DNS, TCP, and TLS setup (for example, the first probe after a blackout)." }
+      },
+      "additionalProperties": false
+    },
+    "sample": {
+      "type": "object",
+      "required": ["type", "t_ms", "path", "probe"],
+      "properties": {
+        "type": { "const": "sample" },
+        "t_ms": { "type": "integer", "minimum": 0 },
+        "path": { "$ref": "#/$defs/path" },
+        "probe": { "$ref": "#/$defs/probe" }
+      },
+      "additionalProperties": false
+    },
+    "motion": {
+      "$comment": "One second of accelerometer readings without gravity (CoreMotion userAcceleration), in milli-g, device axes. Readings are evenly spaced at hz, starting at t_ms. A dropped reading shortens the arrays. gravity_mg is the mean gravity vector over the batch; it shows phone orientation.",
+      "type": "object",
+      "required": ["type", "t_ms", "hz", "x_mg", "y_mg", "z_mg"],
+      "properties": {
+        "type": { "const": "motion" },
+        "t_ms": { "type": "integer", "minimum": 0 },
+        "hz": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "x_mg": { "type": "array", "items": { "type": "integer" } },
+        "y_mg": { "type": "array", "items": { "type": "integer" } },
+        "z_mg": { "type": "array", "items": { "type": "integer" } },
+        "gravity_mg": { "type": "array", "items": { "type": "integer" }, "minItems": 3, "maxItems": 3 }
+      },
+      "additionalProperties": false
+    },
+    "mark": {
+      "$comment": "The rider tapped Mark (optional, for example when doors open). A timestamp only, with no station label.",
+      "type": "object",
+      "required": ["type", "t_ms"],
+      "properties": {
+        "type": { "const": "mark" },
+        "t_ms": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "session_end": {
+      "type": "object",
+      "required": ["type", "ended_at"],
+      "properties": {
+        "type": { "const": "session_end" },
+        "t_ms": { "type": "integer", "minimum": 0, "$comment": "When the rider tapped Stop." },
+        "ended_at": { "type": "string", "format": "date-time" },
+        "reason": { "type": "string" },
+        "successful": { "type": "boolean" },
+        "end_station_id": { "type": "string", "$comment": "Where the rider got off. Absent when the rider chose Not sure." },
+        "end_station_name": { "type": "string" },
+        "end_station_index": { "type": "integer", "minimum": 0 },
+        "note": { "type": "string" },
+        "summary": {
+          "type": "object",
+          "properties": {
+            "marks": { "type": "integer", "minimum": 0 },
+            "markers": { "type": "integer", "minimum": 0 },
+            "samples": { "type": "integer", "minimum": 0 },
+            "probe_ok": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

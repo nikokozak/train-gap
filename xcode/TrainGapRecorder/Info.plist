@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged into the generated Info.plist (GENERATE_INFOPLIST_FILE = YES).
+  It sits outside the synchronized TrainGapRecorder/ folder so Xcode does not also copy it as a resource.
+  The "location" background mode keeps the recorder running while the phone is locked.
+  Location fixes are never read or saved.
+-->
+<plist version="1.0">
+<dict>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+	</array>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Location access keeps the recording running while your phone is locked. Train-Gap does not save your location.</string>
+</dict>
+</plist>
