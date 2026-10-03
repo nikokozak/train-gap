@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"train-gap/internal/lines"
+	"github.com/nikokozak/train-gap/internal/lines"
 )
 
 func TestTrainUpdateCarriesOverTimeAcrossStates(t *testing.T) {

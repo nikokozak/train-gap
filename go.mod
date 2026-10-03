@@ -1,4 +1,4 @@
-module train-gap
+module github.com/nikokozak/train-gap
 
 go 1.25.3
 

@@ -10,5 +10,19 @@ train-gap
 # OS
 .DS_Store
 
-# Claude
+# Agent instructions (local only). AGENTS.md is a symlink to CLAUDE.md.
 CLAUDE.md
+AGENTS.md
+
+# Temporary docs: audits, reviews, plans, scratch notes
+docs/notes/
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xccheckout
+*.xcscmblueprint

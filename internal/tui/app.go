@@ -7,8 +7,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"train-gap/internal/lines"
-	"train-gap/internal/sim"
+	"github.com/nikokozak/train-gap/internal/lines"
+	"github.com/nikokozak/train-gap/internal/sim"
 )
 
 const (

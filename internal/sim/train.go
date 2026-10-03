@@ -1,8 +1,8 @@
 package sim
 
 import (
+	"github.com/nikokozak/train-gap/internal/lines"
 	"time"
-	"train-gap/internal/lines"
 )
 
 // Direction constants

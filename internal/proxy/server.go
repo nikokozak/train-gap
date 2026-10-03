@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/armon/go-socks5"
-	"train-gap/internal/sim"
+	"github.com/nikokozak/train-gap/internal/sim"
 )
 
 // Stats holds proxy statistics

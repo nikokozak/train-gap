@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"train-gap/internal/sim"
+	"github.com/nikokozak/train-gap/internal/sim"
 )
 
 // Shaper controls network conditions for connections

@@ -8,7 +8,7 @@ import (
 	"sort"
 	"time"
 
-	"train-gap/internal/lines"
+	"github.com/nikokozak/train-gap/internal/lines"
 )
 
 type exportLine struct {

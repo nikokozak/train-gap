@@ -46,7 +46,8 @@ var LTrain = Line{
 		{FromID: "uni", ToID: "3av", IsTunnel: false, Duration: 75 * time.Second, Degradation: 0.7},
 		{FromID: "3av", ToID: "1av", IsTunnel: false, Duration: 60 * time.Second, Degradation: 0.8},
 
-		// THE FAMOUS EAST RIVER TUNNEL - complete blackout for ~3 minutes
+		// East River (Canarsie) tunnel. Modeled as a ~3 minute blackout, but the real
+		// tunnel has had cell service since 2020-21. Recorded rides will replace this.
 		{FromID: "1av", ToID: "bed", IsTunnel: true, Duration: 180 * time.Second, Degradation: 0.0},
 
 		// Brooklyn segments - mixed service

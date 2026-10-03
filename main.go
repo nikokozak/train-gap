@@ -7,10 +7,10 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"train-gap/internal/lines"
-	"train-gap/internal/proxy"
-	"train-gap/internal/sim"
-	"train-gap/internal/tui"
+	"github.com/nikokozak/train-gap/internal/lines"
+	"github.com/nikokozak/train-gap/internal/proxy"
+	"github.com/nikokozak/train-gap/internal/sim"
+	"github.com/nikokozak/train-gap/internal/tui"
 )
 
 var (
@@ -25,8 +25,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, `Train-Gap: NYC Subway Network Simulator
 
 A SOCKS5 proxy that simulates NYC subway connectivity patterns.
-Route your traffic through the proxy to test against real-world
-network conditions like the L train's East River tunnel.
+Route your traffic through the proxy to test how your app handles
+signal loss between stations, packet loss, and latency spikes.
 
 Usage:
   train-gap [flags]
