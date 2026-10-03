@@ -14,8 +14,11 @@ type Shaper struct {
 	condition sim.NetworkCondition
 }
 
+var seedOnce sync.Once
+
 // NewShaper creates a new Shaper with full connectivity
 func NewShaper() *Shaper {
+	seedOnce.Do(func() { rand.Seed(time.Now().UnixNano()) })
 	return &Shaper{
 		condition: sim.FullConnectivity(),
 	}
@@ -25,7 +28,7 @@ func NewShaper() *Shaper {
 func (s *Shaper) SetCondition(c sim.NetworkCondition) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.condition = c
+	s.condition = c.Normalized()
 }
 
 // GetCondition returns the current network condition

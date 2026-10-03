@@ -65,7 +65,7 @@ Testing:
 	defer proxyServer.Stop()
 
 	// Create TUI model
-	model := tui.NewModel(line, *flagPort)
+	model := tui.NewModel(line, proxyServer.Port())
 
 	// Apply initial settings
 	train := model.GetTrain()

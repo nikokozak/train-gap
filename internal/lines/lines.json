@@ -1,0 +1,346 @@
+{
+  "generated_at": "2026-02-02T00:00:00Z",
+  "lines": [
+    {
+      "id": "L",
+      "name": "Canarsie",
+      "color": "#A7A9AC",
+      "direction_forward_label": "To Canarsie-Rockaway Pkwy",
+      "direction_backward_label": "To 8 Av",
+      "stations": [
+        {
+          "id": "8av",
+          "name": "8th Avenue",
+          "short_name": "8th Ave",
+          "has_service": true,
+          "dwell_ms": 30000
+        },
+        {
+          "id": "6av",
+          "name": "6th Avenue",
+          "short_name": "6th Ave",
+          "has_service": true,
+          "dwell_ms": 25000
+        },
+        {
+          "id": "uni",
+          "name": "14th St-Union Sq",
+          "short_name": "Union Sq",
+          "has_service": true,
+          "dwell_ms": 35000
+        },
+        {
+          "id": "3av",
+          "name": "3rd Avenue",
+          "short_name": "3rd Ave",
+          "has_service": true,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "1av",
+          "name": "1st Avenue",
+          "short_name": "1st Ave",
+          "has_service": true,
+          "dwell_ms": 25000
+        },
+        {
+          "id": "bed",
+          "name": "Bedford Avenue",
+          "short_name": "Bedford",
+          "has_service": true,
+          "dwell_ms": 30000
+        },
+        {
+          "id": "lor",
+          "name": "Lorimer Street",
+          "short_name": "Lorimer",
+          "has_service": true,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "gra",
+          "name": "Graham Avenue",
+          "short_name": "Graham",
+          "has_service": false,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "grd",
+          "name": "Grand Street",
+          "short_name": "Grand",
+          "has_service": false,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "mon",
+          "name": "Montrose Avenue",
+          "short_name": "Montrose",
+          "has_service": false,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "mor",
+          "name": "Morgan Avenue",
+          "short_name": "Morgan",
+          "has_service": false,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "jef",
+          "name": "Jefferson Street",
+          "short_name": "Jefferson",
+          "has_service": false,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "dek",
+          "name": "DeKalb Avenue",
+          "short_name": "DeKalb",
+          "has_service": false,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "myr",
+          "name": "Myrtle-Wyckoff",
+          "short_name": "Myrtle",
+          "has_service": true,
+          "dwell_ms": 25000
+        },
+        {
+          "id": "hal",
+          "name": "Halsey Street",
+          "short_name": "Halsey",
+          "has_service": false,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "wil",
+          "name": "Wilson Avenue",
+          "short_name": "Wilson",
+          "has_service": false,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "bus",
+          "name": "Bushwick-Aberdeen",
+          "short_name": "Bushwick",
+          "has_service": false,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "bwy",
+          "name": "Broadway Junction",
+          "short_name": "Broadway",
+          "has_service": true,
+          "dwell_ms": 30000
+        },
+        {
+          "id": "atl",
+          "name": "Atlantic Avenue",
+          "short_name": "Atlantic",
+          "has_service": false,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "sut",
+          "name": "Sutter Avenue",
+          "short_name": "Sutter",
+          "has_service": false,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "liv",
+          "name": "Livonia Avenue",
+          "short_name": "Livonia",
+          "has_service": false,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "nlt",
+          "name": "New Lots Avenue",
+          "short_name": "New Lots",
+          "has_service": false,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "e105",
+          "name": "East 105th Street",
+          "short_name": "E 105 St",
+          "has_service": false,
+          "dwell_ms": 20000
+        },
+        {
+          "id": "can",
+          "name": "Canarsie-Rockaway",
+          "short_name": "Canarsie",
+          "has_service": true,
+          "dwell_ms": 45000
+        }
+      ],
+      "segments": [
+        {
+          "from_id": "8av",
+          "to_id": "6av",
+          "is_tunnel": false,
+          "duration_ms": 90000,
+          "degradation": 0.8
+        },
+        {
+          "from_id": "6av",
+          "to_id": "uni",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.9
+        },
+        {
+          "from_id": "uni",
+          "to_id": "3av",
+          "is_tunnel": false,
+          "duration_ms": 75000,
+          "degradation": 0.7
+        },
+        {
+          "from_id": "3av",
+          "to_id": "1av",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.8
+        },
+        {
+          "from_id": "1av",
+          "to_id": "bed",
+          "is_tunnel": true,
+          "duration_ms": 180000,
+          "degradation": 0.0
+        },
+        {
+          "from_id": "bed",
+          "to_id": "lor",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.6
+        },
+        {
+          "from_id": "lor",
+          "to_id": "gra",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.4
+        },
+        {
+          "from_id": "gra",
+          "to_id": "grd",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.3
+        },
+        {
+          "from_id": "grd",
+          "to_id": "mon",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.3
+        },
+        {
+          "from_id": "mon",
+          "to_id": "mor",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.4
+        },
+        {
+          "from_id": "mor",
+          "to_id": "jef",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.4
+        },
+        {
+          "from_id": "jef",
+          "to_id": "dek",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.5
+        },
+        {
+          "from_id": "dek",
+          "to_id": "myr",
+          "is_tunnel": false,
+          "duration_ms": 75000,
+          "degradation": 0.6
+        },
+        {
+          "from_id": "myr",
+          "to_id": "hal",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.4
+        },
+        {
+          "from_id": "hal",
+          "to_id": "wil",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.4
+        },
+        {
+          "from_id": "wil",
+          "to_id": "bus",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.5
+        },
+        {
+          "from_id": "bus",
+          "to_id": "bwy",
+          "is_tunnel": false,
+          "duration_ms": 75000,
+          "degradation": 0.7
+        },
+        {
+          "from_id": "bwy",
+          "to_id": "atl",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.5
+        },
+        {
+          "from_id": "atl",
+          "to_id": "sut",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.4
+        },
+        {
+          "from_id": "sut",
+          "to_id": "liv",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.4
+        },
+        {
+          "from_id": "liv",
+          "to_id": "nlt",
+          "is_tunnel": false,
+          "duration_ms": 60000,
+          "degradation": 0.5
+        },
+        {
+          "from_id": "nlt",
+          "to_id": "e105",
+          "is_tunnel": false,
+          "duration_ms": 90000,
+          "degradation": 0.6
+        },
+        {
+          "from_id": "e105",
+          "to_id": "can",
+          "is_tunnel": false,
+          "duration_ms": 90000,
+          "degradation": 0.8
+        }
+      ]
+    }
+  ]
+}
+

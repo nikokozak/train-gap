@@ -24,6 +24,7 @@ type Model struct {
 	condition sim.NetworkCondition
 	proxyPort int
 	startTime time.Time
+	lastTick  time.Time
 	width     int
 	height    int
 	quitting  bool
@@ -31,12 +32,14 @@ type Model struct {
 }
 
 func NewModel(line *lines.Line, proxyPort int) Model {
+	now := time.Now()
 	return Model{
 		train:     sim.NewTrain(line),
 		line:      line,
 		condition: sim.FullConnectivity(),
 		proxyPort: proxyPort,
-		startTime: time.Now(),
+		startTime: now,
+		lastTick:  now,
 		width:     80,
 		height:    24,
 	}
@@ -78,7 +81,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 
 	case TickMsg:
-		m.condition = m.train.Update(tickInterval)
+		now := time.Time(msg)
+		dt := now.Sub(m.lastTick)
+		if dt <= 0 {
+			dt = tickInterval
+		}
+		// Avoid huge jumps after pauses/suspends.
+		if dt > 2*time.Second {
+			dt = 2 * time.Second
+		}
+		m.lastTick = now
+		m.condition = m.train.Update(dt)
 		m.frame++
 		return m, tick()
 	}
@@ -91,31 +104,42 @@ func (m Model) View() string {
 		return ""
 	}
 
+	if m.line == nil || m.train == nil {
+		return "Train-Gap: internal error (missing model)"
+	}
+
+	if m.width <= 0 || m.height <= 0 {
+		return ""
+	}
+
 	w := maxWidth
 	if m.width < maxWidth+4 {
 		w = m.width - 4
+	}
+	if w < 20 {
+		return lipgloss.NewStyle().
+			Padding(1, 2).
+			Render("TRAIN-GAP\n\nWindow too small.\nResize your terminal.")
 	}
 
 	bg := lipgloss.Color("#16161e")
 	lineColor := LineColors[m.line.ID]
 
 	container := lipgloss.NewStyle().
-		Width(w + 4).
+		Width(w+4).
 		Background(bg).
 		Padding(1, 2)
 
 	var b strings.Builder
 	b.WriteString(m.viewHeader(w, lineColor))
 	b.WriteString("\n\n")
-	b.WriteString(m.viewTrain(w, lineColor))
-	b.WriteString("\n\n")
 	b.WriteString(m.viewTrack(w, lineColor))
 	b.WriteString("\n\n")
 	b.WriteString(m.viewState(w, lineColor))
 	b.WriteString("\n\n")
-	b.WriteString(m.viewStatus(w))
+	b.WriteString(m.viewMetrics(w))
 	b.WriteString("\n\n")
-	b.WriteString(m.viewHelp(w))
+	b.WriteString(m.viewFooter(w))
 
 	box := container.Render(b.String())
 
@@ -131,7 +155,9 @@ func (m Model) View() string {
 func (m Model) viewHeader(w int, lineColor lipgloss.Color) string {
 	// Destination based on direction
 	var destination string
-	if m.train.Direction > 0 {
+	if len(m.line.Stations) == 0 {
+		destination = "---"
+	} else if m.train.Direction > 0 {
 		// Going towards end of line (Brooklyn/Canarsie for L)
 		destination = m.line.Stations[len(m.line.Stations)-1].ShortName
 	} else {
@@ -172,43 +198,29 @@ func (m Model) viewHeader(w int, lineColor lipgloss.Color) string {
 	return left + strings.Repeat(" ", gap) + right
 }
 
-func (m Model) viewTrain(w int, lineColor lipgloss.Color) string {
-	var color lipgloss.Color
-	if !m.condition.Connected {
-		color = ColorDisconnected
-	} else if m.condition.PacketLoss > 0.3 {
-		color = ColorDegrading
-	} else {
-		color = lineColor
-	}
-
-	style := lipgloss.NewStyle().Foreground(color)
-
-	// Clean subway car - no wheels, integrated with track
-	car1 := "┌─────────────────────┐"
-	car2 := fmt.Sprintf("│ ▐███▌   %s   ▐███▌ │",
-		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#fff")).Background(color).Render(" "+m.line.ID+" "))
-	car3 := "└─────────────────────┘"
-
-	trainW := 23
-	pad := (w - trainW) / 2
-	if pad < 0 {
-		pad = 0
-	}
-	sp := strings.Repeat(" ", pad)
-
-	return sp + style.Render(car1) + "\n" +
-		sp + style.Render(car2) + "\n" +
-		sp + style.Render(car3)
-}
-
 func (m Model) viewTrack(w int, lineColor lipgloss.Color) string {
 	idx, prog := m.train.DisplayPosition()
+
+	if len(m.line.Stations) == 0 {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#666")).Render("No stations configured.")
+	}
 
 	// Show 5 stations
 	n := 5
 	if n > len(m.line.Stations) {
 		n = len(m.line.Stations)
+	}
+
+	// Ensure we have enough width per station to avoid division-by-zero and negative padding.
+	minColW := 4
+	if n > 1 && w/n < minColW {
+		n = w / minColW
+		if n < 1 {
+			n = 1
+		}
+		if n > len(m.line.Stations) {
+			n = len(m.line.Stations)
+		}
 	}
 
 	start := idx - n/2
@@ -226,109 +238,142 @@ func (m Model) viewTrack(w int, lineColor lipgloss.Color) string {
 
 	stations := m.line.Stations[start:end]
 	colW := w / n
+	if colW < 1 {
+		colW = 1
+	}
+	totalLen := n * colW
 
 	lineStyle := lipgloss.NewStyle().Foreground(lineColor)
 	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#555"))
-	bright := lipgloss.NewStyle().Foreground(lipgloss.Color("#fff")).Bold(true)
 
-	// Calculate train position on track
-	// prog goes from 0 (at station) to ~1 (arriving at next)
-	trainStationIdx := idx - start // relative index in visible stations
-
-	// Build track as continuous line with station dots
-	var trackChars []string
-	totalLen := n * colW
-
-	// Pre-fill with spaces
-	for i := 0; i < totalLen; i++ {
-		trackChars = append(trackChars, " ")
+	// Train badge style - MTA grey background with white text
+	trainBadge := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#fff")).
+		Background(lineColor).
+		Render(" " + m.line.ID + " ")
+	trainBadgeWidth := lipgloss.Width(trainBadge)
+	if trainBadgeWidth < 1 {
+		trainBadgeWidth = 1
 	}
 
-	// Place track segments and stations
+	// Calculate station center positions
+	stationCenters := make([]int, n)
 	for i := 0; i < n; i++ {
-		stationPos := i*colW + colW/2 // center of column
+		stationCenters[i] = i*colW + colW/2
+	}
 
-		// Draw track before this station (from previous station center to this station center)
-		if i > 0 {
-			prevPos := (i-1)*colW + colW/2
+	// Calculate train position
+	trainStationIdx := idx - start
+	var trainFloatPos float64
+	if prog < 0.1 {
+		trainFloatPos = float64(trainStationIdx)
+	} else {
+		normalizedProg := (prog - 0.1) / 0.8
+		if normalizedProg > 1.0 {
+			normalizedProg = 1.0
+		}
+		if m.train.Direction > 0 {
+			trainFloatPos = float64(trainStationIdx) + normalizedProg
+		} else {
+			trainFloatPos = float64(trainStationIdx) - normalizedProg
+		}
+	}
+
+	// Convert to character position
+	trainCharPos := int(trainFloatPos*float64(colW) + float64(colW)/2)
+	trainStart := trainCharPos - trainBadgeWidth/2
+	trainEnd := trainStart + trainBadgeWidth
+	useBadge := trainStart >= 0 && trainEnd <= totalLen
+	if trainCharPos < 0 {
+		trainCharPos = 0
+	} else if trainCharPos >= totalLen {
+		trainCharPos = totalLen - 1
+	}
+	trainMarker := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#fff")).
+		Background(lineColor).
+		Render("■")
+
+	// Build track line
+	var trackLine strings.Builder
+
+	for i := 0; i < totalLen; i++ {
+		// Check if this position is where the train badge goes
+		if useBadge && i >= trainStart && i < trainEnd {
+			if i == trainStart {
+				trackLine.WriteString(trainBadge)
+			}
+			continue
+		}
+		if !useBadge && i == trainCharPos {
+			trackLine.WriteString(trainMarker)
+			continue
+		}
+
+		// Check if this is a station center
+		isStation := false
+		for _, center := range stationCenters {
+			if i == center {
+				isStation = true
+				break
+			}
+		}
+
+		if isStation {
+			trackLine.WriteString(lineStyle.Render("●"))
+			continue
+		}
+
+		// Check if we're between two stations (should draw track)
+		inTrackSegment := false
+		var segmentIdx int
+		for j := 0; j < n-1; j++ {
+			if i > stationCenters[j] && i < stationCenters[j+1] {
+				inTrackSegment = true
+				segmentIdx = j
+				break
+			}
+		}
+
+		if inTrackSegment {
+			// Check if this segment is a tunnel
 			isTunnel := false
-			if seg := m.line.GetSegment(stations[i-1].ID, stations[i].ID); seg != nil && seg.IsTunnel {
+			if seg := m.line.GetSegment(stations[segmentIdx].ID, stations[segmentIdx+1].ID); seg != nil && seg.IsTunnel {
 				isTunnel = true
 			}
-
-			for j := prevPos + 1; j < stationPos; j++ {
-				if isTunnel {
-					trackChars[j] = dim.Render("┄")
-				} else {
-					trackChars[j] = lineStyle.Render("─")
-				}
-			}
-		}
-
-		// Place station dot
-		realIdx := start + i
-		isCurrentStation := realIdx == idx && prog < 0.1
-		if isCurrentStation {
-			trackChars[stationPos] = bright.Render("◉")
-		} else {
-			trackChars[stationPos] = lineStyle.Render("●")
-		}
-	}
-
-	// Place moving train dot if in transit
-	if prog >= 0.1 && prog < 0.95 {
-		// Determine direction and calculate positions
-		var fromPos, toPos int
-		canShowDot := false
-
-		if m.train.Direction > 0 {
-			// Forward: moving from trainStationIdx to trainStationIdx+1
-			if trainStationIdx >= 0 && trainStationIdx < n-1 {
-				fromPos = trainStationIdx*colW + colW/2
-				toPos = (trainStationIdx+1)*colW + colW/2
-				canShowDot = true
+			if isTunnel {
+				trackLine.WriteString(dim.Render("┄"))
+			} else {
+				trackLine.WriteString(lineStyle.Render("─"))
 			}
 		} else {
-			// Backward: moving from trainStationIdx to trainStationIdx-1
-			if trainStationIdx > 0 && trainStationIdx < n {
-				fromPos = trainStationIdx*colW + colW/2
-				toPos = (trainStationIdx-1)*colW + colW/2
-				canShowDot = true
-			}
-		}
-
-		if canShowDot {
-			// Map prog (0.1 to 0.9) to position in segment
-			normalizedProg := (prog - 0.1) / 0.8 // 0 to 1
-			if normalizedProg > 1.0 {
-				normalizedProg = 1.0
-			}
-
-			// Interpolate between from and to
-			trainPos := fromPos + int(normalizedProg*float64(toPos-fromPos))
-
-			// Ensure we're within bounds and not on a station dot
-			minPos, maxPos := fromPos, toPos
-			if toPos < fromPos {
-				minPos, maxPos = toPos, fromPos
-			}
-			if trainPos > minPos && trainPos < maxPos && trainPos >= 0 && trainPos < len(trackChars) {
-				trackChars[trainPos] = bright.Render("●")
-			}
+			trackLine.WriteString(" ")
 		}
 	}
-
-	trackLine := strings.Join(trackChars, "")
 
 	// Build name line
+	bright := lipgloss.NewStyle().Foreground(lipgloss.Color("#fff")).Bold(true)
 	var nameRow strings.Builder
 	for i, st := range stations {
 		name := st.ShortName
-		if len(name) > colW-1 {
-			name = name[:colW-2] + "."
+		maxName := colW - 1
+		if maxName < 1 {
+			maxName = 1
+		}
+		if len(name) > maxName {
+			if maxName == 1 {
+				name = "."
+			} else {
+				name = name[:maxName-1] + "."
+			}
 		}
 
 		totalPad := colW - len(name)
+		if totalPad < 0 {
+			totalPad = 0
+		}
 		leftPad := totalPad / 2
 		rightPad := totalPad - leftPad
 
@@ -346,11 +391,16 @@ func (m Model) viewTrack(w int, lineColor lipgloss.Color) string {
 		}
 	}
 
-	return trackLine + "\n" + nameRow.String()
+	return trackLine.String() + "\n" + nameRow.String()
 }
 
 func (m Model) viewState(w int, lineColor lipgloss.Color) string {
 	prog := m.train.Progress
+	if prog < 0 {
+		prog = 0
+	} else if prog > 1 {
+		prog = 1
+	}
 
 	var color lipgloss.Color
 	var label string
@@ -401,7 +451,15 @@ func (m Model) viewState(w int, lineColor lipgloss.Color) string {
 		dim.Render(strings.Repeat("░", empty))
 
 	pct := int(prog * 100)
+	if pct < 0 {
+		pct = 0
+	} else if pct > 100 {
+		pct = 100
+	}
 	remaining := (100 - pct) / 10
+	if remaining < 0 {
+		remaining = 0
+	}
 
 	return fmt.Sprintf("%-10s %s %3d%% %s",
 		style.Render(label),
@@ -410,81 +468,130 @@ func (m Model) viewState(w int, lineColor lipgloss.Color) string {
 		dim.Render(fmt.Sprintf("~%ds", remaining)))
 }
 
-func (m Model) viewStatus(w int) string {
-	var icon, text string
-	var color lipgloss.Color
+func (m Model) viewMetrics(w int) string {
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#666"))
+	val := lipgloss.NewStyle().Foreground(lipgloss.Color("#fff")).Bold(true)
+
+	// Connection status
+	var icon, statusText string
+	var statusColor lipgloss.Color
 
 	switch {
 	case !m.condition.Connected:
-		icon, text, color = "◯", "DISCONNECTED", ColorDisconnected
+		icon, statusText, statusColor = "◯", "DISCONNECTED", ColorDisconnected
 	case m.condition.PacketLoss > 0.5:
-		icon, text, color = "◔", "POOR SIGNAL", ColorDisconnected
+		icon, statusText, statusColor = "◔", "POOR SIGNAL", ColorDisconnected
 	case m.condition.PacketLoss > 0.3:
-		icon, text, color = "◐", "DEGRADED", ColorDegrading
+		icon, statusText, statusColor = "◐", "DEGRADED", ColorDegrading
 	case m.condition.PacketLoss > 0.1:
-		icon, text, color = "◑", "RECOVERING", ColorRecovering
+		icon, statusText, statusColor = "◑", "RECOVERING", ColorRecovering
 	default:
-		icon, text, color = "●", "CONNECTED", ColorConnected
+		icon, statusText, statusColor = "●", "CONNECTED", ColorConnected
 	}
 
-	style := lipgloss.NewStyle().Foreground(color).Bold(true)
-	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#666"))
-	val := lipgloss.NewStyle().Foreground(lipgloss.Color("#fff"))
+	statusStyle := lipgloss.NewStyle().Foreground(statusColor).Bold(true)
+	statusLine := statusStyle.Render(icon + " " + statusText)
 
-	left := style.Render(icon + " " + text)
+	// Latency bar
+	latencyMs := m.condition.Latency.Milliseconds()
+	if latencyMs < 0 {
+		latencyMs = 0
+	}
+	latencyPct := float64(latencyMs) / 500.0 // 500ms = 100%
+	if latencyPct > 1.0 {
+		latencyPct = 1.0
+	}
+	barW := w - 28 // Space for label and value
+	if barW < 10 {
+		barW = 10
+	}
+	latencyFilled := int(latencyPct * float64(barW))
+	latencyEmpty := barW - latencyFilled
 
-	latency := fmt.Sprintf("+%dms", m.condition.Latency.Milliseconds())
-	loss := fmt.Sprintf("%.0f%%", m.condition.PacketLoss*100)
+	latencyBar := lipgloss.NewStyle().Foreground(statusColor).Render(strings.Repeat("█", latencyFilled)) +
+		dim.Render(strings.Repeat("░", latencyEmpty))
+	latencyLine := dim.Render("Latency      ") + val.Render(fmt.Sprintf("%4dms", latencyMs)) + "  " + latencyBar
 
-	right := dim.Render("Lat ") + val.Render(latency) + dim.Render("  Loss ") + val.Render(loss)
+	// Packet Loss bar
+	lossPct := m.condition.PacketLoss
+	if lossPct < 0 {
+		lossPct = 0
+	} else if lossPct > 1 {
+		lossPct = 1
+	}
+	lossFilled := int(lossPct * float64(barW))
+	lossEmpty := barW - lossFilled
+
+	var lossColor lipgloss.Color
+	if lossPct > 0.5 {
+		lossColor = ColorDisconnected
+	} else if lossPct > 0.2 {
+		lossColor = ColorDegrading
+	} else {
+		lossColor = ColorConnected
+	}
+
+	lossBar := lipgloss.NewStyle().Foreground(lossColor).Render(strings.Repeat("█", lossFilled)) +
+		dim.Render(strings.Repeat("░", lossEmpty))
+	lossLine := dim.Render("Packet Loss  ") + val.Render(fmt.Sprintf("%5.0f%%", lossPct*100)) + "  " + lossBar
+
+	return statusLine + "\n\n" + latencyLine + "\n" + lossLine
+}
+
+func (m Model) viewFooter(w int) string {
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#555"))
+	accent := lipgloss.NewStyle().Foreground(lipgloss.Color("#888"))
+
+	// Left: full proxy address
+	proxyAddr := accent.Render(fmt.Sprintf("socks5://localhost:%d", m.proxyPort))
+
+	// Mode indicator (if any)
+	var mode string
+	if m.train.Paused {
+		mode = lipgloss.NewStyle().Foreground(ColorDegrading).Bold(true).Render("PAUSED")
+	} else if m.train.ManualMode {
+		mode = lipgloss.NewStyle().Foreground(ColorRecovering).Bold(true).Render("MANUAL")
+	} else if m.train.Speed != 1.0 {
+		mode = dim.Render(fmt.Sprintf("%.1fx", m.train.Speed))
+	}
+
+	// Right: uptime
+	uptime := time.Since(m.startTime).Round(time.Second)
+	uptimeStr := accent.Render(fmt.Sprintf("Up %dm%02ds", int(uptime.Minutes()), int(uptime.Seconds())%60))
+
+	// Build line with proper spacing
+	left := proxyAddr
+	right := uptimeStr
 
 	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
+	if mode != "" {
+		gap = gap - lipgloss.Width(mode) - 2
+	}
 	if gap < 1 {
 		gap = 1
 	}
 
-	line1 := left + strings.Repeat(" ", gap) + right
-
-	// Line 2: proxy
-	uptime := time.Since(m.startTime).Round(time.Second)
-	proxy := dim.Render("Proxy ") + val.Render(fmt.Sprintf("localhost:%d", m.proxyPort))
-
-	mode := ""
-	if m.train.Paused {
-		mode = style.Render(" PAUSED")
-	} else if m.train.ManualMode {
-		mode = lipgloss.NewStyle().Foreground(ColorRecovering).Bold(true).Render(" MANUAL")
-	} else if m.train.Speed != 1.0 {
-		mode = dim.Render(fmt.Sprintf(" %.1fx", m.train.Speed))
+	var line string
+	if mode != "" {
+		leftGap := gap / 2
+		rightGap := gap - leftGap
+		line = left + strings.Repeat(" ", leftGap) + mode + strings.Repeat(" ", rightGap) + right
+	} else {
+		line = left + strings.Repeat(" ", gap) + right
 	}
 
-	up := dim.Render(fmt.Sprintf("Up %dm%02ds", int(uptime.Minutes()), int(uptime.Seconds())%60))
+	// Help hints
+	help := dim.Render("spc") + accent.Render(" pause  ") +
+		dim.Render("←→") + accent.Render(" speed  ") +
+		dim.Render("m") + accent.Render(" manual  ") +
+		dim.Render("q") + accent.Render(" quit")
 
-	gap2 := w - lipgloss.Width(proxy) - lipgloss.Width(mode) - lipgloss.Width(up)
-	if gap2 < 1 {
-		gap2 = 1
+	helpPad := (w - lipgloss.Width(help)) / 2
+	if helpPad < 0 {
+		helpPad = 0
 	}
 
-	line2 := proxy + mode + strings.Repeat(" ", gap2) + up
-
-	return line1 + "\n" + line2
-}
-
-func (m Model) viewHelp(w int) string {
-	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#444"))
-	key := lipgloss.NewStyle().Foreground(lipgloss.Color("#666"))
-
-	help := key.Render("spc") + dim.Render(" pause  ") +
-		key.Render("←→") + dim.Render(" speed  ") +
-		key.Render("m") + dim.Render(" manual  ") +
-		key.Render("q") + dim.Render(" quit")
-
-	pad := (w - lipgloss.Width(help)) / 2
-	if pad < 0 {
-		pad = 0
-	}
-
-	return strings.Repeat(" ", pad) + help
+	return line + "\n\n" + strings.Repeat(" ", helpPad) + help
 }
 
 func (m Model) GetCondition() sim.NetworkCondition {

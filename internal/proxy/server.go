@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -30,6 +29,26 @@ type Server struct {
 	stats    Stats
 	running  bool
 	mu       sync.Mutex
+}
+
+type timeoutError string
+
+func (e timeoutError) Error() string   { return string(e) }
+func (e timeoutError) Timeout() bool   { return true }
+func (e timeoutError) Temporary() bool { return true }
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // NewServer creates a new proxy server
@@ -66,6 +85,11 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to listen on port %d: %w", s.port, err)
 	}
 	s.listener = listener
+	if s.port == 0 {
+		if addr, ok := listener.Addr().(*net.TCPAddr); ok {
+			s.port = addr.Port
+		}
+	}
 	s.running = true
 
 	// Accept connections in background
@@ -76,6 +100,7 @@ func (s *Server) Start() error {
 
 // acceptLoop accepts incoming connections
 func (s *Server) acceptLoop() {
+	var backoff time.Duration
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -86,18 +111,37 @@ func (s *Server) acceptLoop() {
 			if !running {
 				return
 			}
+
+			// Avoid busy-looping on repeated Accept errors.
+			// net.Error.Temporary is deprecated but still used by net.Listener implementations.
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				if backoff == 0 {
+					backoff = 10 * time.Millisecond
+				} else {
+					backoff *= 2
+					if backoff > 500*time.Millisecond {
+						backoff = 500 * time.Millisecond
+					}
+				}
+				time.Sleep(backoff)
+				continue
+			}
+
+			// Non-temporary error while still running; sleep briefly to avoid pegging CPU.
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 
+		backoff = 0
 		atomic.AddInt64(&s.stats.Connections, 1)
 
 		// Handle connection in background
-		go func() {
-			if err := s.server.ServeConn(conn); err != nil {
+		go func(c net.Conn) {
+			if err := s.server.ServeConn(c); err != nil {
 				// Connection error (likely shaped/dropped)
 				atomic.AddInt64(&s.stats.DroppedConns, 1)
 			}
-		}()
+		}(conn)
 	}
 }
 
@@ -106,13 +150,15 @@ func (s *Server) shapedDial(ctx context.Context, network, addr string) (net.Conn
 	// Check if completely blocked
 	if s.shaper.IsBlocked() {
 		// Simulate connection timeout
-		time.Sleep(500 * time.Millisecond)
-		return nil, fmt.Errorf("connection timeout (tunnel)")
+		_ = sleepWithContext(ctx, 500*time.Millisecond)
+		return nil, timeoutError("connection timeout (tunnel)")
 	}
 
 	// Add connection delay
 	if delay := s.shaper.Delay(); delay > 0 {
-		time.Sleep(delay)
+		if err := sleepWithContext(ctx, delay); err != nil {
+			return nil, err
+		}
 	}
 
 	// Dial the actual connection
@@ -179,7 +225,7 @@ func (c *shapedConnWrapper) Read(b []byte) (int, error) {
 	// Check if blocked
 	if c.shaper.IsBlocked() {
 		time.Sleep(100 * time.Millisecond)
-		return 0, io.EOF
+		return 0, &net.OpError{Op: "read", Err: timeoutError("read timeout (tunnel)")}
 	}
 
 	// Apply delay
@@ -206,7 +252,7 @@ func (c *shapedConnWrapper) Write(b []byte) (int, error) {
 	// Check if blocked
 	if c.shaper.IsBlocked() {
 		time.Sleep(100 * time.Millisecond)
-		return 0, io.EOF
+		return 0, &net.OpError{Op: "write", Err: timeoutError("write timeout (tunnel)")}
 	}
 
 	// Apply delay

@@ -53,34 +53,51 @@ func (t *Train) Update(dt time.Duration) NetworkCondition {
 		return t.currentCondition()
 	}
 
+	if t.Progress < 0 {
+		t.Progress = 0
+	} else if t.Progress > 1 {
+		t.Progress = 1
+	}
+
+	if dt < 0 {
+		dt = 0
+	}
+
 	// Apply speed multiplier
 	effectiveDt := time.Duration(float64(dt) * t.Speed)
 
-	// Advance progress
-	if t.stateDur > 0 {
-		t.Progress += float64(effectiveDt) / float64(t.stateDur)
-	} else {
-		// Prevent division by zero - force state advance
-		t.Progress = 1.0
-	}
-
-	// Handle state transitions - allow multiple transitions per tick if needed
-	// (e.g., at high speed, we might skip through short states)
-	maxTransitions := 5 // Safety limit to prevent infinite loops
-	for t.Progress >= 1.0 && maxTransitions > 0 {
-		overflow := t.Progress - 1.0
-		t.advanceState()
-		// Carry over the overflow progress
-		if t.stateDur > 0 {
-			t.Progress = overflow * float64(effectiveDt) / float64(t.stateDur)
-			if t.Progress > 1.0 {
-				t.Progress = 1.0 // Cap it, let next iteration handle it
-			}
+	remaining := effectiveDt
+	maxTransitions := 20
+	for remaining > 0 && maxTransitions > 0 {
+		// Prevent division by zero / broken state durations.
+		if t.stateDur <= 0 {
+			t.Progress = 1.0
+			t.advanceState()
+			maxTransitions--
+			continue
 		}
+
+		remainingInState := time.Duration(float64(t.stateDur) * (1.0 - t.Progress))
+		if remaining < remainingInState {
+			t.Progress += float64(remaining) / float64(t.stateDur)
+			remaining = 0
+			break
+		}
+
+		// Consume the rest of this state and advance.
+		remaining -= remainingInState
+		t.Progress = 1.0
+		t.advanceState()
 		maxTransitions--
 	}
 
-	return t.currentCondition()
+	if t.Progress < 0 {
+		t.Progress = 0
+	} else if t.Progress > 1 {
+		t.Progress = 1
+	}
+
+	return t.currentCondition().Normalized()
 }
 
 // advanceState moves to the next state

@@ -2,6 +2,7 @@ package lines
 
 import "time"
 
+// Deprecated: use internal/lines/lines.json (iOS dataset) instead.
 // LTrain defines the L train (Canarsie line)
 // The L runs from 8th Avenue in Manhattan to Canarsie-Rockaway Pkwy in Brooklyn
 // Famous for the long East River tunnel between 1st Ave and Bedford Ave
@@ -72,6 +73,9 @@ var LTrain = Line{
 
 // GetLine returns a line by ID
 func GetLine(id string) *Line {
+	if l := getLineFromStore(id); l != nil {
+		return l
+	}
 	switch id {
 	case "L":
 		return &LTrain
@@ -82,5 +86,8 @@ func GetLine(id string) *Line {
 
 // AvailableLines returns the IDs of all available lines
 func AvailableLines() []string {
+	if ids := availableLinesFromStore(); len(ids) > 0 {
+		return ids
+	}
 	return []string{"L"}
 }

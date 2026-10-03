@@ -1,6 +1,9 @@
 package sim
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // State represents the current state of the train
 type State int
@@ -39,6 +42,25 @@ type NetworkCondition struct {
 	InTunnel   bool          // Whether we're in a tunnel (for UI)
 }
 
+func (c NetworkCondition) Normalized() NetworkCondition {
+	if math.IsNaN(c.PacketLoss) || math.IsInf(c.PacketLoss, 0) {
+		c.PacketLoss = 0
+	}
+	if c.PacketLoss < 0 {
+		c.PacketLoss = 0
+	} else if c.PacketLoss > 1 {
+		c.PacketLoss = 1
+	}
+	if c.Latency < 0 {
+		c.Latency = 0
+	}
+	if !c.Connected {
+		c.PacketLoss = 1
+		c.InTunnel = true
+	}
+	return c
+}
+
 // FullConnectivity returns a NetworkCondition with full connectivity
 func FullConnectivity() NetworkCondition {
 	return NetworkCondition{
@@ -46,7 +68,7 @@ func FullConnectivity() NetworkCondition {
 		Latency:    0,
 		Connected:  true,
 		InTunnel:   false,
-	}
+	}.Normalized()
 }
 
 // Disconnected returns a NetworkCondition for complete disconnection
@@ -56,11 +78,19 @@ func Disconnected() NetworkCondition {
 		Latency:    0,
 		Connected:  false,
 		InTunnel:   true,
-	}
+	}.Normalized()
 }
 
 // Degraded returns a NetworkCondition with partial connectivity
 func Degraded(quality float64) NetworkCondition {
+	if math.IsNaN(quality) || math.IsInf(quality, 0) {
+		quality = 0
+	}
+	if quality < 0 {
+		quality = 0
+	} else if quality > 1 {
+		quality = 1
+	}
 	// quality is 0.0 (worst) to 1.0 (best)
 	// invert for packet loss
 	loss := 1.0 - quality
@@ -72,5 +102,5 @@ func Degraded(quality float64) NetworkCondition {
 		Latency:    latency,
 		Connected:  true,
 		InTunnel:   false,
-	}
+	}.Normalized()
 }

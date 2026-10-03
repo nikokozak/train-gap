@@ -92,10 +92,10 @@ type Styles struct {
 	App lipgloss.Style
 
 	// Header
-	Header       lipgloss.Style
-	HeaderTitle  lipgloss.Style
-	HeaderLine   lipgloss.Style
-	LineBadge    lipgloss.Style
+	Header      lipgloss.Style
+	HeaderTitle lipgloss.Style
+	HeaderLine  lipgloss.Style
+	LineBadge   lipgloss.Style
 
 	// Track area
 	TrackContainer lipgloss.Style
