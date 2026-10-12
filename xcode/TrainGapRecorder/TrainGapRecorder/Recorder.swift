@@ -4,6 +4,7 @@ import CoreTelephony
 import CryptoKit
 import Foundation
 import Network
+import Synchronization
 import UIKit
 
 /// Records one subway ride as an NDJSON file of raw evidence: a network probe every second,
@@ -24,7 +25,7 @@ final class Recorder: ObservableObject {
     static let motionHz = 20
 
     /// Rotated round-robin so that no single endpoint rate-limits us.
-    static let defaultProbeURLs = [
+    static let probeURLs = [
         URL(string: "https://www.google.com/generate_204")!,
         URL(string: "https://captive.apple.com/hotspot-detect.html")!,
         URL(string: "https://cloudflare.com/cdn-cgi/trace")!,
@@ -72,6 +73,7 @@ final class Recorder: ObservableObject {
     private var motionBatch = MotionBatch()
 
     private let locationManager = CLLocationManager()
+    private var backgroundActivitySession: CLBackgroundActivitySession?
     private let telephonyInfo = CTTelephonyNetworkInfo()
 
     private struct ProbeBackoffState {
@@ -209,6 +211,7 @@ final class Recorder: ObservableObject {
             nextTickTime += Self.tickInterval
             let delay = nextTickTime - Self.clockSeconds()
             if delay > 0 {
+                // Sleep only throws when cancelled (at finish); the loop condition then ends the loop.
                 try? await Task.sleep(for: .seconds(delay))
             } else {
                 // We fell behind, for example because iOS paused the app. Skip the missed
@@ -238,6 +241,8 @@ final class Recorder: ObservableObject {
         guard let writer else { return false }
         do {
             try await writer.append(event)
+            // Writes work again: drop an old error, so the rider does not stop a healthy recording.
+            errorMessage = nil
             return true
         } catch {
             errorMessage = "Could not save to the session file: \(error.localizedDescription)"
@@ -312,7 +317,7 @@ final class Recorder: ObservableObject {
     }
 
     private func nextProbeURL() -> URL {
-        let urls = config?.probeURLs ?? Self.defaultProbeURLs
+        let urls = Self.probeURLs
         let nowTime = Self.clockSeconds()
 
         for _ in 0..<urls.count {
@@ -441,13 +446,14 @@ final class Recorder: ObservableObject {
 
     /// The "location" background mode is only a way to stay awake: location updates are
     /// requested but never read or saved.
-    /// Limit: if iOS still suspends the app during a ride, add a CLBackgroundActivitySession.
     private func startLocationKeepAlive() {
         locationManager.desiredAccuracy = kCLLocationAccuracyThreeKilometers  // Lowest power; we ignore the fixes.
         locationManager.pausesLocationUpdatesAutomatically = false  // Underground there are no fixes; a pause would suspend the app.
         locationManager.allowsBackgroundLocationUpdates = true  // Needs UIBackgroundModes "location" in Info.plist.
         locationManager.showsBackgroundLocationIndicator = true  // The blue status pill shows that recording is alive.
         locationManager.startUpdatingLocation()
+        // Tells iOS that a When-In-Use app has an ongoing activity, so it keeps running in the background.
+        backgroundActivitySession = CLBackgroundActivitySession()
     }
 
     private func stopSensors() {
@@ -457,6 +463,8 @@ final class Recorder: ObservableObject {
         motionManager.stopDeviceMotionUpdates()
         locationManager.stopUpdatingLocation()
         locationManager.allowsBackgroundLocationUpdates = false
+        backgroundActivitySession?.invalidate()
+        backgroundActivitySession = nil
     }
 
     // MARK: - Time
@@ -499,7 +507,7 @@ final class Recorder: ObservableObject {
             systemVersion: UIDevice.current.systemVersion
         )
         let dataset = LinesDatasetInfo(source: "bundle:lines.json", generatedAt: nil, sha256: bundledLinesJSONSHA256())
-        let probeURLs = config.probeURLs.map(\.absoluteString)
+        let probeURLs = Self.probeURLs.map(\.absoluteString)
         let routeIndices = [config.startStationIndex] + line.stationIndicesAfter(config.startStationIndex, direction: config.direction)
         let routeStations = routeIndices.map { RouteStation(id: line.stations[$0].id, name: line.stations[$0].shortName) }
 
@@ -582,10 +590,16 @@ private struct MotionBatch {
 
 /// Records whether a probe reused an open connection. A new connection adds DNS, TCP, and TLS time.
 /// URLSession reports metrics before the request completes, so the value is set when `data(for:)` returns.
-private final class ConnectionReuseObserver: NSObject, URLSessionTaskDelegate {
-    private(set) var isReusedConnection: Bool?
+/// The callback runs on URLSession's queue and the read on the main actor, so a mutex guards the value.
+private final class ConnectionReuseObserver: NSObject, URLSessionTaskDelegate, Sendable {
+    private let reusedConnection = Mutex<Bool?>(nil)
+
+    var isReusedConnection: Bool? {
+        reusedConnection.withLock { $0 }
+    }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
-        isReusedConnection = metrics.transactionMetrics.last?.isReusedConnection
+        let isReused = metrics.transactionMetrics.last?.isReusedConnection
+        reusedConnection.withLock { $0 = isReused }
     }
 }

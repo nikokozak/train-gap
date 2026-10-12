@@ -61,7 +61,6 @@ struct SessionConfig: Hashable {
     var startStationName: String
     var startStationIndex: Int
     var carrier: String
-    var probeURLs: [URL]
 }
 
 struct SessionInfo: Identifiable, Hashable {

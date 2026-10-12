@@ -86,20 +86,27 @@ func detectSegments(batches []motionBatch, marks []mark, samples []sample, route
 	}
 	stops = append(stops, makeStop(route, finalPosition, previousEndMS, recordingEndMS, samples))
 
+	detection.MarksInsideStops = countMarksOutsideRuns(marks, labelled)
+	return segments, stops, detection
+}
+
+// countMarksOutsideRuns is the calibration check: the rider taps Mark when the doors open,
+// so with good thresholds every mark falls in a stop, not inside a moving run.
+func countMarksOutsideRuns(marks []mark, runs []labelledRun) int {
+	count := 0
 	for _, markEvent := range marks {
-		insideSegment := false
-		for _, run := range labelled {
+		insideRun := false
+		for _, run := range runs {
 			if markEvent.TMS >= run.startMS && markEvent.TMS < run.endMS {
-				insideSegment = true
+				insideRun = true
 				break
 			}
 		}
-		if !insideSegment {
-			detection.MarksInsideStops++
+		if !insideRun {
+			count++
 		}
 	}
-
-	return segments, stops, detection
+	return count
 }
 
 func makeStop(route []routeStation, position int, startMS, endMS int64, samples []sample) stopSummary {

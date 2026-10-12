@@ -135,8 +135,7 @@ struct RecordSetupView: View {
             startStationID: startStation.id,
             startStationName: startStation.shortName,
             startStationIndex: startStationIndex,
-            carrier: carrier,
-            probeURLs: Recorder.defaultProbeURLs
+            carrier: carrier
         )
 
         isStarting = true

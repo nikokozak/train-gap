@@ -1,18 +1,22 @@
 package main
 
 import (
+	"encoding/json"
 	"math"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
 // Motion strengths for synthetic rides, in milli-g RMS.
 const (
-	stillMilliG   = 5
-	trainMilliG   = 40
-	walkMilliG    = 300
-	noMotionData  = -1 // The app was paused: no batches for this phase.
-	readingsPerHz = 20
+	stillMilliG      = 5
+	trainMilliG      = 40
+	walkMilliG       = 300
+	noMotionData     = -1 // The app was paused: no batches for this phase.
+	readingsPerBatch = 20 // One-second batches at 20 Hz.
 )
 
 // phase is one stretch of a synthetic ride: how long it lasts and how hard the phone shakes.
@@ -29,7 +33,7 @@ func syntheticMotion(phases ...phase) []motionBatch {
 	for _, ridePhase := range phases {
 		for second := 0; second < ridePhase.seconds; second++ {
 			if ridePhase.rmsMilliG != noMotionData {
-				xMilliG := make([]int, readingsPerHz)
+				xMilliG := make([]int, readingsPerBatch)
 				for index := range xMilliG {
 					xMilliG[index] = ridePhase.rmsMilliG
 					if index%2 == 1 {
@@ -38,10 +42,10 @@ func syntheticMotion(phases ...phase) []motionBatch {
 				}
 				batches = append(batches, motionBatch{
 					TMS:     timeMS,
-					Hz:      readingsPerHz,
+					Hz:      readingsPerBatch,
 					XMilliG: xMilliG,
-					YMilliG: make([]int, readingsPerHz),
-					ZMilliG: make([]int, readingsPerHz),
+					YMilliG: make([]int, readingsPerBatch),
+					ZMilliG: make([]int, readingsPerBatch),
 				})
 			}
 			timeMS += batchDurationMS
@@ -269,5 +273,54 @@ func TestDetectSegmentsLabelsARide(t *testing.T) {
 	}
 	if !reflect.DeepEqual(gotStops, wantStops) {
 		t.Fatalf("stops = %+v; want %+v", gotStops, wantStops)
+	}
+}
+
+// summarizeFile must read the new recorder events by the exact JSON names the iPhone app writes
+// (RecorderEvents.swift). A wrong tag would otherwise skip detection or drop the end station silently.
+func TestSummarizeFileReadsNewRecorderEvents(t *testing.T) {
+	var lines []string
+	addEvent := func(event any) {
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, string(encoded))
+	}
+
+	addEvent(map[string]any{
+		"type": "session_start", "v": 1, "session_id": "test", "started_at": "2026-10-03T12:00:00Z",
+		"line_id": "X", "from_station_id": "A", "direction": "forward",
+		"route_stations": []map[string]string{{"id": "A", "name": "Alpha"}, {"id": "B", "name": "Bravo"}, {"id": "C", "name": "Charlie"}},
+	})
+	batches := syntheticMotion(phase{20, stillMilliG}, phase{60, trainMilliG}, phase{20, stillMilliG}, phase{60, trainMilliG}, phase{20, stillMilliG})
+	for _, batch := range batches {
+		addEvent(struct {
+			Type string `json:"type"`
+			motionBatch
+		}{"motion", batch})
+		addEvent(map[string]any{"type": "sample", "t_ms": batch.TMS, "path": map[string]any{"status": "satisfied"}, "probe": map[string]any{"ok": true, "rtt_ms": 50}})
+	}
+	addEvent(map[string]any{"type": "mark", "t_ms": 90_000})
+	addEvent(map[string]any{"type": "session_end", "t_ms": 180_000, "ended_at": "2026-10-03T12:03:00Z", "end_station_id": "C", "end_station_name": "Charlie"})
+
+	path := filepath.Join(t.TempDir(), "ride.ndjson")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := summarizeFile(path, defaultDetectionSettings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	detection := result.StopDetection
+	if detection == nil || detection.Status != statusMatched || detection.ExpectedSegments == nil || *detection.ExpectedSegments != 2 {
+		t.Fatalf("stop detection = %+v; want matched with 2 expected segments", detection)
+	}
+	if detection.Marks != 1 || detection.MarksInsideStops != 1 {
+		t.Fatalf("marks = %d, inside stops = %d; want 1 and 1", detection.Marks, detection.MarksInsideStops)
+	}
+	if len(result.Segments) != 2 || result.Segments[1].FromStationName != "Bravo" || result.Segments[1].ToStationName != "Charlie" {
+		t.Fatalf("segments = %+v; want Alpha->Bravo, Bravo->Charlie", result.Segments)
 	}
 }
