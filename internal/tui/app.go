@@ -1,3 +1,5 @@
+// Package tui draws a ride in the terminal: the strip map, the network condition, and the
+// connections through the proxy.
 package tui
 
 import (
@@ -8,39 +10,43 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/nikokozak/train-gap/internal/lines"
+	"github.com/nikokozak/train-gap/internal/proxy"
 	"github.com/nikokozak/train-gap/internal/sim"
 )
 
 const (
-	maxWidth     = 64
 	tickInterval = 50 * time.Millisecond
 	speedStep    = 1.5 // Each arrow key press changes the speed by this factor.
+
+	maxContentWidth = 72 // Wide enough for the connection log; wider only adds empty space.
+	minContentWidth = 36 // Below this, the view is one summary line.
+	// Vertical space around the content: one row of padding above and below.
+	verticalPadding = 2
+	// Horizontal space around the content: two columns of padding on each side.
+	horizontalPadding = 4
+
+	visibleStations   = 5
+	minStationColumns = 8 // Narrower columns cannot show a station name.
+	maxLogRows        = 6
+	narrowLogWidth    = 60 // Below this, log rows leave out the time and the byte count.
 )
 
-type TickMsg time.Time
+type tickMsg time.Time
 
-// Model draws a ride. The ride runs on its own clock; the model only reads it and passes keys on.
+// Model draws a ride. The ride runs on its own clock and the proxy keeps its own log; the model
+// only reads them and passes keys on.
 type Model struct {
-	ride      *sim.Ride
-	line      *lines.Line
-	proxyPort int
-	startTime time.Time
-	width     int
-	height    int
-	quitting  bool
-	frame     int
+	ride        *sim.Ride
+	line        *lines.Line
+	proxyServer *proxy.Server
+	width       int
+	height      int
+	quitting    bool
 }
 
-// NewModel shows the ride and the proxy port that applies it.
-func NewModel(ride *sim.Ride, proxyPort int) Model {
-	return Model{
-		ride:      ride,
-		line:      ride.Line,
-		proxyPort: proxyPort,
-		startTime: time.Now(),
-		width:     80,
-		height:    24,
-	}
+// NewModel shows the ride and the proxy that applies it.
+func NewModel(ride *sim.Ride, proxyServer *proxy.Server) Model {
+	return Model{ride: ride, line: ride.Line, proxyServer: proxyServer, width: 80, height: 24}
 }
 
 func (m Model) Init() tea.Cmd {
@@ -48,9 +54,7 @@ func (m Model) Init() tea.Cmd {
 }
 
 func tick() tea.Cmd {
-	return tea.Tick(tickInterval, func(t time.Time) tea.Msg {
-		return TickMsg(t)
-	})
+	return tea.Tick(tickInterval, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -71,424 +75,322 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.ride.SetSpeed(1.0)
 		}
-
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-
-	case TickMsg:
-		// The ride keeps its own time; a tick only redraws.
-		m.frame++
-		return m, tick()
+		m.width, m.height = msg.Width, msg.Height
+	case tickMsg:
+		return m, tick() // The ride keeps its own time; a tick only redraws.
 	}
-
 	return m, nil
 }
 
+// View fits the panel to the terminal. Space goes first to the strip map, the condition, and the
+// controls; the connection log gets what is left; blank separators go first when space is short.
 func (m Model) View() string {
-	if m.quitting {
+	if m.quitting || m.width <= 0 || m.height <= 0 {
 		return ""
 	}
-
-	if m.line == nil || m.ride == nil {
-		return "Train-Gap: internal error (missing model)"
+	width := min(maxContentWidth, m.width-horizontalPadding)
+	availableRows := m.height - verticalPadding
+	const rowsWithoutLog = 7 // header 1, track 2, condition 2, footer 2
+	if width < minContentWidth || availableRows < rowsWithoutLog {
+		return m.viewSummaryLine()
 	}
 
-	if m.width <= 0 || m.height <= 0 {
-		return ""
+	sections := [][]string{m.viewHeader(width), m.viewTrack(width), m.viewCondition(width), m.viewFooter(width)}
+	isSpacious := availableRows >= rowsWithoutLog+len(sections)-1
+	separatorRows := 0
+	if isSpacious {
+		separatorRows = len(sections) - 1
+	}
+	// The log needs its own separator, a title row, and at least one connection row.
+	if logRows := min(maxLogRows, availableRows-rowsWithoutLog-separatorRows-2); isSpacious && logRows >= 1 {
+		footer := sections[len(sections)-1]
+		sections = append(sections[:len(sections)-1], m.viewLog(width, logRows), footer)
 	}
 
-	w := maxWidth
-	if m.width < maxWidth+4 {
-		w = m.width - 4
+	var rows []string
+	for index, section := range sections {
+		if index > 0 && isSpacious {
+			rows = append(rows, "")
+		}
+		rows = append(rows, section...)
 	}
-	if w < 20 {
-		return lipgloss.NewStyle().
-			Padding(1, 2).
-			Render("TRAIN-GAP\n\nWindow too small.\nResize your terminal.")
-	}
-
-	bg := lipgloss.Color("#16161e")
-	lineColor := LineColors[m.line.ID]
-
-	container := lipgloss.NewStyle().
-		Width(w+4).
-		Background(bg).
-		Padding(1, 2)
-
-	var b strings.Builder
-	b.WriteString(m.viewHeader(w, lineColor))
-	b.WriteString("\n\n")
-	b.WriteString(m.viewTrack(w, lineColor))
-	b.WriteString("\n\n")
-	b.WriteString(m.viewState(w, lineColor))
-	b.WriteString("\n\n")
-	b.WriteString(m.viewMetrics(w))
-	b.WriteString("\n\n")
-	b.WriteString(m.viewFooter(w))
-
-	box := container.Render(b.String())
-
-	// Center
-	if m.width > lipgloss.Width(box) {
-		pad := (m.width - lipgloss.Width(box)) / 2
-		box = strings.Repeat(" ", pad) + box
+	for index, row := range rows {
+		rows[index] = fitWidth(row, width)
 	}
 
-	return box
+	panel := lipgloss.NewStyle().
+		Background(colorPanel).
+		Padding(verticalPadding/2, horizontalPadding/2).
+		Width(width + horizontalPadding).
+		Render(strings.Join(rows, "\n"))
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
 }
 
-func (m Model) viewHeader(w int, lineColor lipgloss.Color) string {
-	// Destination based on direction
+// viewSummaryLine is the whole view in a pane too small for the panel.
+func (m Model) viewSummaryLine() string {
+	condition := m.ride.Condition()
+	summary := fmt.Sprintf("%s %s  localhost:%d", m.line.ID, strings.ToUpper(condition.Describe()), m.proxyServer.Port())
+	return fitWidth(summary, m.width)
+}
+
+// viewHeader shows the line, where the train is heading, and the app name.
+func (m Model) viewHeader(width int) []string {
 	phase, _, _ := m.ride.Position()
-	destination := m.line.Stations[0].ShortName
+	destination := m.line.Stations[0]
 	if phase.IsForward {
-		destination = m.line.Stations[len(m.line.Stations)-1].ShortName
+		destination = m.line.Stations[len(m.line.Stations)-1]
 	}
-
-	badge := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#000")).
-		Background(lineColor).
-		Padding(0, 1).
-		Render(m.line.ID)
-
-	dest := lipgloss.NewStyle().
-		Foreground(lineColor).
-		Render(destination)
-
-	title := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#fff")).
-		Render("TRAIN-GAP")
-
-	from := m.line.Stations[phase.FromIndex].ShortName
-	to := m.line.Stations[phase.ToIndex].ShortName
-	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#666"))
-	bright := lipgloss.NewStyle().Foreground(lipgloss.Color("#fff")).Bold(true)
-	right := dim.Render("@ ") + bright.Render(from)
-	if phase.Kind == sim.Running {
-		right = bright.Render(from) + dim.Render(" → ") + bright.Render(to)
-	}
-
-	left := badge + " " + dest + "  " + title
-
-	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 1 {
-		gap = 1
-	}
-
-	return left + strings.Repeat(" ", gap) + right
+	left := badge(m.line.ID) + paint(colorText, " ▸ ") + paintBold(colorBright, destination.ShortName)
+	return []string{spread(left, paintBold(colorDim, "TRAIN-GAP"), width)}
 }
 
-func (m Model) viewTrack(w int, lineColor lipgloss.Color) string {
+// viewTrack draws the strip map: a few stations around the train, the track between them
+// (dotted through a tunnel without service), and the train moving along it.
+func (m Model) viewTrack(width int) []string {
 	phase, _, offset := m.ride.Position()
-	idx := phase.FromIndex
+	stations := m.line.Stations
+	stationCount := min(visibleStations, len(stations), width/minStationColumns)
+	firstIndex := min(max(0, phase.FromIndex-stationCount/2), len(stations)-stationCount)
+	columnWidth := width / stationCount
+	trackWidth := stationCount * columnWidth
 
-	// Show 5 stations
-	n := 5
-	if n > len(m.line.Stations) {
-		n = len(m.line.Stations)
-	}
-
-	// Ensure we have enough width per station to avoid division-by-zero and negative padding.
-	minColW := 4
-	if n > 1 && w/n < minColW {
-		n = w / minColW
-		if n < 1 {
-			n = 1
-		}
-		if n > len(m.line.Stations) {
-			n = len(m.line.Stations)
-		}
-	}
-
-	start := idx - n/2
-	if start < 0 {
-		start = 0
-	}
-	end := start + n
-	if end > len(m.line.Stations) {
-		end = len(m.line.Stations)
-		start = end - n
-		if start < 0 {
-			start = 0
-		}
-	}
-
-	stations := m.line.Stations[start:end]
-	colW := w / n
-	if colW < 1 {
-		colW = 1
-	}
-	totalLen := n * colW
-
-	lineStyle := lipgloss.NewStyle().Foreground(lineColor)
-	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#555"))
-
-	// Train badge style - MTA grey background with white text
-	trainBadge := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#fff")).
-		Background(lineColor).
-		Render(" " + m.line.ID + " ")
-	trainBadgeWidth := lipgloss.Width(trainBadge)
-	if trainBadgeWidth < 1 {
-		trainBadgeWidth = 1
-	}
-
-	// Calculate station center positions
-	stationCenters := make([]int, n)
-	for i := 0; i < n; i++ {
-		stationCenters[i] = i*colW + colW/2
-	}
-
-	// Calculate train position
-	trainFloatPos := float64(idx - start)
+	// The train's position in columns from the first visible station. A run moves it smoothly.
+	trainColumns := float64(phase.FromIndex - firstIndex)
 	if phase.Kind == sim.Running && phase.Duration > 0 {
-		runProgress := float64(offset) / float64(phase.Duration)
-		trainFloatPos += float64(phase.ToIndex-phase.FromIndex) * runProgress
+		progress := min(1, float64(offset)/float64(phase.Duration))
+		trainColumns += float64(phase.ToIndex-phase.FromIndex) * progress
+	}
+	train := badge(m.line.ID)
+	trainWidth := lipgloss.Width(train)
+	trainStart := int(trainColumns*float64(columnWidth)) + columnWidth/2 - trainWidth/2
+	trainStart = min(max(0, trainStart), trackWidth-trainWidth)
+
+	color := lineColor(m.line.ID)
+	lastCenter := (stationCount-1)*columnWidth + columnWidth/2
+	var track strings.Builder
+	for position := 0; position < trackWidth; position++ {
+		if position == trainStart {
+			track.WriteString(train)
+			position += trainWidth - 1
+			continue
+		}
+		// Station k sits in the middle of column k; segment k runs between stations k and k+1.
+		fromFirstCenter := position - columnWidth/2
+		switch {
+		case fromFirstCenter < 0 || position > lastCenter:
+			track.WriteString(paint(colorText, " ")) // Before the first or after the last station.
+		case fromFirstCenter%columnWidth == 0:
+			track.WriteString(paint(color, "●"))
+		case m.line.Segments[firstIndex+fromFirstCenter/columnWidth].HasService:
+			track.WriteString(paint(color, "━"))
+		default:
+			track.WriteString(paint(colorDim, "┄"))
+		}
 	}
 
-	// Convert to character position
-	trainCharPos := int(trainFloatPos*float64(colW) + float64(colW)/2)
-	trainStart := trainCharPos - trainBadgeWidth/2
-	trainEnd := trainStart + trainBadgeWidth
-	useBadge := trainStart >= 0 && trainEnd <= totalLen
-	if trainCharPos < 0 {
-		trainCharPos = 0
-	} else if trainCharPos >= totalLen {
-		trainCharPos = totalLen - 1
-	}
-	trainMarker := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#fff")).
-		Background(lineColor).
-		Render("■")
-
-	// Build track line
-	var trackLine strings.Builder
-
-	for i := 0; i < totalLen; i++ {
-		// Check if this position is where the train badge goes
-		if useBadge && i >= trainStart && i < trainEnd {
-			if i == trainStart {
-				trackLine.WriteString(trainBadge)
-			}
-			continue
-		}
-		if !useBadge && i == trainCharPos {
-			trackLine.WriteString(trainMarker)
-			continue
-		}
-
-		// Check if this is a station center
-		isStation := false
-		for _, center := range stationCenters {
-			if i == center {
-				isStation = true
-				break
-			}
-		}
-
-		if isStation {
-			trackLine.WriteString(lineStyle.Render("●"))
-			continue
-		}
-
-		// Check if we're between two stations (should draw track)
-		inTrackSegment := false
-		var segmentIdx int
-		for j := 0; j < n-1; j++ {
-			if i > stationCenters[j] && i < stationCenters[j+1] {
-				inTrackSegment = true
-				segmentIdx = j
-				break
-			}
-		}
-
-		if inTrackSegment {
-			// A dotted track is a tunnel without service.
-			if !m.line.Segments[start+segmentIdx].HasService {
-				trackLine.WriteString(dim.Render("┄"))
-			} else {
-				trackLine.WriteString(lineStyle.Render("─"))
-			}
+	// The station the train stands at, or runs to, is bright.
+	var names strings.Builder
+	for index := firstIndex; index < firstIndex+stationCount; index++ {
+		name := truncateText(stations[index].ShortName, columnWidth-1)
+		leftPad := (columnWidth - len([]rune(name))) / 2
+		rightPad := columnWidth - len([]rune(name)) - leftPad
+		names.WriteString(paint(colorText, strings.Repeat(" ", leftPad)))
+		if index == phase.ToIndex {
+			names.WriteString(paintBold(colorBright, name))
 		} else {
-			trackLine.WriteString(" ")
+			names.WriteString(paint(colorDim, name))
 		}
+		names.WriteString(paint(colorText, strings.Repeat(" ", rightPad)))
 	}
-
-	// Build name line
-	bright := lipgloss.NewStyle().Foreground(lipgloss.Color("#fff")).Bold(true)
-	var nameRow strings.Builder
-	for i, st := range stations {
-		name := st.ShortName
-		maxName := colW - 1
-		if maxName < 1 {
-			maxName = 1
-		}
-		if len(name) > maxName {
-			if maxName == 1 {
-				name = "."
-			} else {
-				name = name[:maxName-1] + "."
-			}
-		}
-
-		totalPad := colW - len(name)
-		if totalPad < 0 {
-			totalPad = 0
-		}
-		leftPad := totalPad / 2
-		rightPad := totalPad - leftPad
-
-		realIdx := start + i
-		isHere := realIdx == idx
-
-		if isHere {
-			nameRow.WriteString(strings.Repeat(" ", leftPad))
-			nameRow.WriteString(bright.Render(name))
-			nameRow.WriteString(strings.Repeat(" ", rightPad))
-		} else {
-			nameRow.WriteString(strings.Repeat(" ", leftPad))
-			nameRow.WriteString(dim.Render(name))
-			nameRow.WriteString(strings.Repeat(" ", rightPad))
-		}
-	}
-
-	return trackLine.String() + "\n" + nameRow.String()
+	return []string{track.String(), names.String()}
 }
 
-// viewState shows what the train is doing and how long until the next stop or run starts.
-func (m Model) viewState(w int, lineColor lipgloss.Color) string {
+// viewCondition shows the network condition the proxy applies, where the train is, and how long
+// until the next stop or run.
+func (m Model) viewCondition(width int) []string {
 	phase, _, offset := m.ride.Position()
 	condition := phase.ConditionAt(offset)
 
 	var color lipgloss.Color
-	var label string
+	var label, delay string
 	switch {
-	case phase.Kind == sim.AtStation:
-		color, label = ColorConnected, "At station"
 	case !condition.IsConnected:
-		color, label = ColorDisconnected, "No service"
+		color, label, delay = colorNoService, "NO SERVICE", "connections wait"
+	case condition.IsWeak():
+		color, label = colorWeak, "WEAK SIGNAL"
 	default:
-		color, label = ColorDegrading, "Running"
+		color, label = colorConnected, "CONNECTED"
 	}
-	style := lipgloss.NewStyle().Foreground(color).Bold(true)
-	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#555"))
-
-	progress := 0.0
-	if phase.Duration > 0 {
-		progress = min(1, float64(offset)/float64(phase.Duration))
+	if condition.IsConnected {
+		delay = fmt.Sprintf("+%d ms each way", condition.Latency.Milliseconds())
 	}
-	barW := max(10, w-24)
-	filled := int(progress * float64(barW))
+	bars := []rune("▂▄▆█")
+	lit := signalBars(condition)
+	status := paint(color, string(bars[:lit])) + paint(colorFaint, string(bars[lit:])) +
+		paint(colorText, "  ") + paintBold(color, label) + paint(colorText, "  ") + paint(colorDim, delay)
 
-	// The bar pulses while there is no service, unless the ride is paused.
-	char := "█"
-	if !condition.IsConnected && !m.ride.IsPaused() {
-		char = "▓"
-		if (m.frame/6)%2 == 1 {
-			char = "░"
+	// Time left in this phase, in wall-clock seconds at the current speed.
+	timeLeft := time.Duration(float64(phase.Duration-offset) / m.ride.Speed()).Round(time.Second)
+	var timing string
+	switch {
+	case m.ride.IsPaused():
+		timing = "held"
+	case phase.Kind == sim.AtStation:
+		timing = fmt.Sprintf("departs in %ds", int(timeLeft.Seconds()))
+	default:
+		timing = fmt.Sprintf("arrives in %ds", int(timeLeft.Seconds()))
+	}
+
+	from := m.line.Stations[phase.FromIndex].ShortName
+	place := paint(colorDim, "At ") + paint(colorText, from)
+	if phase.Kind == sim.Running {
+		place = paint(colorText, from) + paint(colorDim, " → ") + paint(colorText, m.line.Stations[phase.ToIndex].ShortName)
+	}
+	return []string{spread(status, paint(colorText, timing), width), place}
+}
+
+// signalBars is the number of bars a phone would show: none without service, one for a weak
+// signal, more for a shorter delay. The delay limits are a display choice, not a measurement.
+func signalBars(condition sim.Condition) int {
+	switch {
+	case !condition.IsConnected:
+		return 0
+	case condition.IsWeak():
+		return 1
+	case condition.Latency > 150*time.Millisecond:
+		return 2
+	case condition.Latency > 60*time.Millisecond:
+		return 3
+	default:
+		return 4
+	}
+}
+
+// viewLog lists the newest connections through the proxy, so it is clear whether the app uses it
+// and which connections a tunnel holds up.
+func (m Model) viewLog(width, rowCount int) []string {
+	connections := m.proxyServer.RecentConnections()
+	openCount, waitingCount := 0, 0
+	for _, connection := range connections {
+		if connection.IsConnected && !connection.IsClosed {
+			openCount++
+		}
+		if connection.IsWaiting {
+			waitingCount++
 		}
 	}
-	bar := lipgloss.NewStyle().Foreground(color).Render(strings.Repeat(char, filled)) +
-		dim.Render(strings.Repeat("░", barW-filled))
-
-	// Time left in this phase, in real seconds at the current speed.
-	remaining := "held"
-	if !m.ride.IsPaused() {
-		remainingTime := time.Duration(float64(phase.Duration-offset) / m.ride.Speed())
-		remaining = fmt.Sprintf("%ds left", int(remainingTime.Round(time.Second).Seconds()))
+	counts := paint(colorDim, fmt.Sprintf("%d open", openCount))
+	if waitingCount > 0 {
+		counts += paint(colorDim, " · ") + paint(colorNoService, fmt.Sprintf("%d waiting for service", waitingCount))
 	}
+	rows := []string{spread(paintBold(colorDim, "CONNECTIONS"), counts, width)}
 
-	return fmt.Sprintf("%-10s %s %s", style.Render(label), bar, dim.Render(remaining))
+	if len(connections) == 0 {
+		hint := fmt.Sprintf("None yet. Try: curl -x http://localhost:%d https://example.com", m.proxyServer.Port())
+		rows = append(rows, paint(colorText, hint))
+	}
+	for _, connection := range connections[:min(rowCount, len(connections))] {
+		rows = append(rows, logRow(connection, width))
+	}
+	// Empty rows keep the panel's height, so it does not move as connections arrive.
+	for len(rows) < rowCount+1 {
+		rows = append(rows, "")
+	}
+	return rows
 }
 
-// viewMetrics shows the condition the proxy applies right now.
-func (m Model) viewMetrics(w int) string {
-	condition := m.ride.Condition()
-	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#666"))
-	value := lipgloss.NewStyle().Foreground(lipgloss.Color("#fff")).Bold(true)
-
-	var icon, statusText string
-	var statusColor lipgloss.Color
+// logRow is one connection: when it opened, where to, bytes received, and its state.
+func logRow(connection proxy.Connection, width int) string {
+	var state string
 	switch {
-	case !condition.IsConnected:
-		icon, statusText, statusColor = "◯", "NO SERVICE", ColorDisconnected
-	case condition.IsWeak():
-		icon, statusText, statusColor = "◐", "WEAK SIGNAL", ColorRecovering
+	case connection.IsWaiting:
+		state = paint(colorNoService, fmt.Sprintf("waiting %ds", int(connection.Stalled.Seconds())))
+	case connection.HasFailed:
+		state = paint(colorNoService, "failed")
+	case connection.IsClosed:
+		state = paint(colorDim, "closed")
 	default:
-		icon, statusText, statusColor = "●", "CONNECTED", ColorConnected
+		state = paint(colorConnected, "open")
 	}
-	statusLine := lipgloss.NewStyle().Foreground(statusColor).Bold(true).Render(icon + " " + statusText)
-	if !condition.IsConnected {
-		statusLine += dim.Render("  connections wait for service")
+	if !connection.IsWaiting && connection.Stalled >= time.Second {
+		state += paint(colorDim, fmt.Sprintf(" · stalled %ds", int(connection.Stalled.Seconds())))
 	}
+	const stateWidth = 21 // "closed · stalled 120s"
+	state += paint(colorText, strings.Repeat(" ", max(0, stateWidth-lipgloss.Width(state))))
 
-	// Added delay, on a scale where 500 ms fills the bar.
-	barW := max(10, w-28)
-	delayText := "    —"
-	filled := 0
-	if condition.IsConnected {
-		delayText = fmt.Sprintf("%4dms", condition.Latency.Milliseconds())
-		filled = min(barW, int(float64(barW)*float64(condition.Latency)/float64(500*time.Millisecond)))
+	if width < narrowLogWidth {
+		destination := truncateText(connection.Destination, width-stateWidth-1)
+		return spread(paint(colorText, destination), state, width)
 	}
-	delayBar := lipgloss.NewStyle().Foreground(statusColor).Render(strings.Repeat("█", filled)) +
-		dim.Render(strings.Repeat("░", barW-filled))
-	delayLine := dim.Render("Added delay  ") + value.Render(delayText) + "  " + delayBar
-
-	return statusLine + "\n\n" + delayLine
+	opened := paint(colorDim, connection.OpenedAt.Format("15:04:05")+"  ")
+	received := paint(colorDim, fmt.Sprintf("%10s  ", "↓ "+formatBytes(connection.BytesReceived)))
+	destinationWidth := width - lipgloss.Width(opened) - lipgloss.Width(received) - stateWidth - 1
+	destination := paint(colorText, truncateText(connection.Destination, destinationWidth))
+	return spread(opened+destination, received+state, width)
 }
 
-func (m Model) viewFooter(w int) string {
-	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#555"))
-	accent := lipgloss.NewStyle().Foreground(lipgloss.Color("#888"))
+// formatBytes shows a byte count in B, KB, or MB.
+func formatBytes(byteCount int64) string {
+	switch {
+	case byteCount < 1000:
+		return fmt.Sprintf("%d B", byteCount)
+	case byteCount < 1_000_000:
+		return fmt.Sprintf("%.1f KB", float64(byteCount)/1000)
+	default:
+		return fmt.Sprintf("%.1f MB", float64(byteCount)/1_000_000)
+	}
+}
 
-	proxyAddr := accent.Render(fmt.Sprintf("proxy localhost:%d", m.proxyPort))
+// viewFooter shows the proxy address, the mode, and the keys.
+func (m Model) viewFooter(width int) []string {
+	address := paint(colorDim, "proxy ") + paint(colorText, fmt.Sprintf("http://localhost:%d", m.proxyServer.Port()))
 
-	// Mode and speed are both shown, so a paused ride still says how fast it will run.
-	var mode string
+	var modes []string
 	if recordedAt := m.ride.Timeline.RecordedAt; !recordedAt.IsZero() {
-		mode = accent.Render("REPLAY " + recordedAt.Local().Format("Jan 2 15:04"))
+		modes = append(modes, paint(colorText, "replay of "+recordedAt.Local().Format("Jan 2 15:04")))
 	}
 	if m.ride.IsPaused() {
-		mode = strings.TrimSpace(mode + " " + lipgloss.NewStyle().Foreground(ColorDegrading).Bold(true).Render("PAUSED"))
+		modes = append(modes, paintBold(colorWeak, "PAUSED"))
 	}
-	if speed := m.ride.Speed(); speed != 1.0 {
-		mode = strings.TrimSpace(mode + " " + dim.Render(fmt.Sprintf("%.1fx", speed)))
+	modes = append(modes, paint(colorText, fmt.Sprintf("%.1f×", m.ride.Speed())))
+	mode := strings.Join(modes, paint(colorDim, " · "))
+
+	var keys []string
+	for _, key := range [][2]string{{"spc", "pause"}, {"n", "next"}, {"←→", "speed"}, {"r", "1×"}, {"q", "quit"}} {
+		keys = append(keys, paintBold(colorBright, key[0])+paint(colorDim, " "+key[1]))
 	}
+	help := strings.Join(keys, paint(colorText, "  "))
+	return []string{spread(address, mode, width), center(help, width)}
+}
 
-	uptime := time.Since(m.startTime).Round(time.Second)
-	uptimeStr := accent.Render(fmt.Sprintf("Up %dm%02ds", int(uptime.Minutes()), int(uptime.Seconds())%60))
+// spread puts left at the start of the line and right at the end. When both do not fit, the
+// end of the line is cut.
+func spread(left, right string, width int) string {
+	gap := max(1, width-lipgloss.Width(left)-lipgloss.Width(right))
+	return fitWidth(left+paint(colorText, strings.Repeat(" ", gap))+right, width)
+}
 
-	left := proxyAddr
-	right := uptimeStr
-	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
-	if mode != "" {
-		gap = gap - lipgloss.Width(mode) - 2
+// center puts text in the middle of the line.
+func center(text string, width int) string {
+	leftPad := max(0, (width-lipgloss.Width(text))/2)
+	return fitWidth(paint(colorText, strings.Repeat(" ", leftPad))+text, width)
+}
+
+// fitWidth cuts a styled line to width columns.
+func fitWidth(line string, width int) string {
+	return lipgloss.NewStyle().MaxWidth(width).Render(line)
+}
+
+// truncateText shortens plain text to width columns, ending with "…" when it cuts.
+func truncateText(text string, width int) string {
+	characters := []rune(text)
+	switch {
+	case width <= 0:
+		return ""
+	case len(characters) <= width:
+		return text
+	default:
+		return string(characters[:width-1]) + "…"
 	}
-	gap = max(gap, 2) // At least one space on each side of the mode.
-
-	var line string
-	if mode != "" {
-		leftGap := gap / 2
-		rightGap := gap - leftGap
-		line = left + strings.Repeat(" ", leftGap) + mode + strings.Repeat(" ", rightGap) + right
-	} else {
-		line = left + strings.Repeat(" ", gap) + right
-	}
-
-	help := dim.Render("spc") + accent.Render(" pause  ") +
-		dim.Render("n") + accent.Render(" next  ") +
-		dim.Render("←→") + accent.Render(" speed  ") +
-		dim.Render("q") + accent.Render(" quit")
-
-	helpPad := (w - lipgloss.Width(help)) / 2
-	if helpPad < 0 {
-		helpPad = 0
-	}
-
-	return line + "\n\n" + strings.Repeat(" ", helpPad) + help
 }

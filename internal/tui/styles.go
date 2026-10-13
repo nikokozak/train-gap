@@ -1,8 +1,12 @@
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"strconv"
 
-// MTA Official Line Colors
+	"github.com/charmbracelet/lipgloss"
+)
+
+// LineColors are the MTA's official line colors.
 var LineColors = map[string]lipgloss.Color{
 	"L": lipgloss.Color("#A7A9AC"), // Canarsie - Gray
 	"A": lipgloss.Color("#0039A6"), // 8th Ave - Blue
@@ -29,207 +33,57 @@ var LineColors = map[string]lipgloss.Color{
 	"S": lipgloss.Color("#808183"), // Shuttle - Gray
 }
 
-// UI State Colors
+// The panel colors. Text colors have a contrast of at least 4.5:1 on the panel; colorFaint is
+// for decoration only (unlit signal bars).
 var (
-	ColorConnected    = lipgloss.Color("#6CBE45") // Green
-	ColorDisconnected = lipgloss.Color("#EE352E") // MTA Red
-	ColorDegrading    = lipgloss.Color("#FCCC0A") // MTA Yellow
-	ColorRecovering   = lipgloss.Color("#FF6319") // MTA Orange
-	ColorMuted        = lipgloss.Color("#6B6B6B") // Dim gray
-	ColorBright       = lipgloss.Color("#FFFFFF") // White
-	ColorDim          = lipgloss.Color("#4A4A4A") // Dark gray
+	colorPanel     = lipgloss.Color("#16161e")
+	colorBright    = lipgloss.Color("#eeeef4") // 15.6:1
+	colorText      = lipgloss.Color("#b9bdcc") // 9.6:1
+	colorDim       = lipgloss.Color("#8a8fa6") // 5.6:1
+	colorFaint     = lipgloss.Color("#3d4152") // 1.8:1
+	colorConnected = lipgloss.Color("#6CBE45") // 7.8:1
+	colorWeak      = lipgloss.Color("#FCCC0A") // 11.8:1
+	colorNoService = lipgloss.Color("#ff5c55") // 5.9:1; the MTA red (#EE352E) is 4.4:1.
 )
 
-// Box drawing characters
-const (
-	BoxTopLeft     = "╭"
-	BoxTopRight    = "╮"
-	BoxBottomLeft  = "╰"
-	BoxBottomRight = "╯"
-	BoxHorizontal  = "─"
-	BoxVertical    = "│"
-	BoxLeftT       = "├"
-	BoxRightT      = "┤"
-	BoxTopT        = "┬"
-	BoxBottomT     = "┴"
-	BoxCross       = "┼"
-)
-
-// Track characters
-const (
-	TrackLine      = "━"
-	TrackStation   = "●"
-	TrackEmpty     = "○"
-	TrackTunnelIn  = "╲"
-	TrackTunnelOut = "╱"
-	TrackTunnelMid = "_"
-)
-
-// Block elements for progress bars and train
-const (
-	BlockFull   = "█"
-	BlockMedium = "▓"
-	BlockLight  = "▒"
-	BlockEmpty  = "░"
-)
-
-// Train display characters
-const (
-	TrainBodyFull  = "▓"
-	TrainBodyLight = "▒"
-	TrainBodyDim   = "░"
-)
-
-// Arrows
-const (
-	ArrowLeft  = "←"
-	ArrowRight = "→"
-)
-
-// Styles creates all the lipgloss styles for the TUI
-type Styles struct {
-	// Main container
-	App lipgloss.Style
-
-	// Header
-	Header      lipgloss.Style
-	HeaderTitle lipgloss.Style
-	HeaderLine  lipgloss.Style
-	LineBadge   lipgloss.Style
-
-	// Track area
-	TrackContainer lipgloss.Style
-	TrackLine      lipgloss.Style
-	StationName    lipgloss.Style
-	StationActive  lipgloss.Style
-	DirectionHint  lipgloss.Style
-
-	// Train indicator
-	TrainConnected    lipgloss.Style
-	TrainDisconnected lipgloss.Style
-	TrainDegrading    lipgloss.Style
-
-	// Status area
-	StatusContainer lipgloss.Style
-	StatusLabel     lipgloss.Style
-	StatusValue     lipgloss.Style
-	StatusDot       lipgloss.Style
-	ProgressFull    lipgloss.Style
-	ProgressEmpty   lipgloss.Style
-
-	// Help bar
-	HelpContainer lipgloss.Style
-	HelpKey       lipgloss.Style
-	HelpDesc      lipgloss.Style
-
-	// Divider
-	Divider lipgloss.Style
-}
-
-// NewStyles creates a new Styles instance with the given width
-func NewStyles(width int) *Styles {
-	s := &Styles{}
-
-	// Main app container with border
-	s.App = lipgloss.NewStyle().
-		Width(width).
-		Padding(0)
-
-	// Header styles
-	s.Header = lipgloss.NewStyle().
-		Padding(0, 1)
-
-	s.HeaderTitle = lipgloss.NewStyle().
-		Bold(true).
-		Foreground(ColorBright)
-
-	s.HeaderLine = lipgloss.NewStyle().
-		Foreground(ColorMuted)
-
-	s.LineBadge = lipgloss.NewStyle().
-		Bold(true).
-		Padding(0, 1).
-		Background(lipgloss.Color("#A7A9AC")).
-		Foreground(lipgloss.Color("#000000"))
-
-	// Track styles
-	s.TrackContainer = lipgloss.NewStyle().
-		Padding(1, 2)
-
-	s.TrackLine = lipgloss.NewStyle().
-		Foreground(ColorMuted)
-
-	s.StationName = lipgloss.NewStyle().
-		Foreground(ColorMuted)
-
-	s.StationActive = lipgloss.NewStyle().
-		Foreground(ColorBright).
-		Bold(true)
-
-	s.DirectionHint = lipgloss.NewStyle().
-		Foreground(ColorDim).
-		Italic(true)
-
-	// Train styles for different states
-	s.TrainConnected = lipgloss.NewStyle().
-		Foreground(ColorConnected).
-		Bold(true)
-
-	s.TrainDisconnected = lipgloss.NewStyle().
-		Foreground(ColorDisconnected)
-
-	s.TrainDegrading = lipgloss.NewStyle().
-		Foreground(ColorDegrading)
-
-	// Status area
-	s.StatusContainer = lipgloss.NewStyle().
-		Padding(1, 2)
-
-	s.StatusLabel = lipgloss.NewStyle().
-		Foreground(ColorMuted).
-		Width(10)
-
-	s.StatusValue = lipgloss.NewStyle().
-		Foreground(ColorBright)
-
-	s.StatusDot = lipgloss.NewStyle().
-		Bold(true)
-
-	s.ProgressFull = lipgloss.NewStyle().
-		Foreground(ColorConnected)
-
-	s.ProgressEmpty = lipgloss.NewStyle().
-		Foreground(ColorDim)
-
-	// Help bar
-	s.HelpContainer = lipgloss.NewStyle().
-		Padding(0, 2).
-		Foreground(ColorMuted)
-
-	s.HelpKey = lipgloss.NewStyle().
-		Foreground(ColorBright).
-		Bold(true)
-
-	s.HelpDesc = lipgloss.NewStyle().
-		Foreground(ColorMuted)
-
-	// Divider line
-	s.Divider = lipgloss.NewStyle().
-		Foreground(ColorDim)
-
-	return s
-}
-
-// UpdateLineBadge updates the line badge style for a specific line
-func (s *Styles) UpdateLineBadge(lineID string) {
+// lineColor returns the line's color, or gray for a line without one.
+func lineColor(lineID string) lipgloss.Color {
 	if color, ok := LineColors[lineID]; ok {
-		s.LineBadge = s.LineBadge.Background(color)
-		// Use black text for light backgrounds, white for dark
-		switch lineID {
-		case "N", "Q", "R", "W": // Yellow lines need black text
-			s.LineBadge = s.LineBadge.Foreground(lipgloss.Color("#000000"))
-		default:
-			s.LineBadge = s.LineBadge.Foreground(lipgloss.Color("#FFFFFF"))
-		}
+		return color
 	}
+	return lipgloss.Color("#808183")
+}
+
+// badgeTextColor picks black or white, whichever reads better on the line color. The MTA prints
+// white on most bullets, but white on the L's gray is 2.4:1 and unreadable in a terminal.
+func badgeTextColor(background lipgloss.Color) lipgloss.Color {
+	hex := string(background)
+	if len(hex) != 7 {
+		return lipgloss.Color("#ffffff")
+	}
+	red, _ := strconv.ParseUint(hex[1:3], 16, 8) // The colors above are valid hex; a bad one reads as 0.
+	green, _ := strconv.ParseUint(hex[3:5], 16, 8)
+	blue, _ := strconv.ParseUint(hex[5:7], 16, 8)
+	// Perceived brightness (ITU-R BT.601). Above the middle, black text has more contrast.
+	brightness := (299*red + 587*green + 114*blue) / 1000
+	if brightness > 128 {
+		return lipgloss.Color("#000000")
+	}
+	return lipgloss.Color("#ffffff")
+}
+
+// paint colors text on the panel. Every piece of the view goes through paint or paintBold: each
+// styled piece ends with a reset, and a piece without the panel background would leave a hole.
+func paint(color lipgloss.Color, text string) string {
+	return lipgloss.NewStyle().Foreground(color).Background(colorPanel).Render(text)
+}
+
+func paintBold(color lipgloss.Color, text string) string {
+	return lipgloss.NewStyle().Foreground(color).Background(colorPanel).Bold(true).Render(text)
+}
+
+// badge draws a line bullet: the line ID on the line color.
+func badge(lineID string) string {
+	color := lineColor(lineID)
+	return lipgloss.NewStyle().Bold(true).Foreground(badgeTextColor(color)).Background(color).Render(" " + lineID + " ")
 }

@@ -128,6 +128,13 @@ func TestBlackoutStallsWithoutLosingData(t *testing.T) {
 	if string(reply) != "hello" {
 		t.Fatalf("got %q after the blackout; want %q", reply, "hello")
 	}
+
+	// The request log shows the stall and the bytes.
+	connections := server.RecentConnections()
+	if len(connections) != 1 || !connections[0].IsConnected || connections[0].IsWaiting ||
+		connections[0].Stalled < 250*time.Millisecond || connections[0].BytesReceived != 5 {
+		t.Fatalf("request log = %+v; want one connection that stalled and then received 5 bytes", connections)
+	}
 }
 
 // A connection opened during a blackout waits for service rather than failing.

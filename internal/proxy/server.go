@@ -31,6 +31,9 @@ type Stats struct {
 	BytesRecv   int64
 }
 
+// How many connections the request log keeps, newest first.
+const recentConnectionLimit = 50
+
 // Server is a proxy on 127.0.0.1 that shapes traffic with the current condition. One port speaks
 // both SOCKS5 and HTTP (CONNECT, and plain requests with a full URL), because many clients only
 // support one of the two: Node's fetch and Python's requests only use an http:// proxy.
@@ -44,6 +47,9 @@ type Server struct {
 	stats            Stats
 	running          bool
 	mu               sync.Mutex
+
+	recentMu sync.Mutex
+	recent   []*connectionRecord // Oldest first, at most recentConnectionLimit.
 }
 
 // NewServer creates a proxy on port (0 picks a free port). currentCondition is called for
@@ -62,7 +68,8 @@ func (s *Server) Start() error {
 	}
 
 	conf := &socks5.Config{
-		Dial: s.shapedDial,
+		Dial:     s.shapedDial,
+		Resolver: passNamesThrough{},
 		// Failed connections are normal here; the library would print them over the TUI.
 		Logger: log.New(io.Discard, "", 0),
 	}
@@ -213,27 +220,68 @@ func (s *Server) serveConnect(writer http.ResponseWriter, request *http.Request)
 	<-done
 }
 
+// passNamesThrough leaves host names to shapedDial. The SOCKS5 library would otherwise look them
+// up before the dial: without waiting for service, and showing only an address in the request log.
+type passNamesThrough struct{}
+
+func (passNamesThrough) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
+	return ctx, nil, nil
+}
+
 // shapedDial opens the connection to the destination the way a phone would: it waits for
 // service, pays the latency once, and returns a connection that keeps applying the condition.
+// The DNS lookup, if any, happens after the wait, as it would on the phone.
 func (s *Server) shapedDial(ctx context.Context, network, addr string) (net.Conn, error) {
-	if err := waitForService(ctx.Done(), s.currentCondition); err != nil {
+	record := s.recordConnection(addr)
+	if err := waitForService(ctx.Done(), s.currentCondition, record); err != nil {
+		record.fail()
 		return nil, err
 	}
 	if err := sleepWithCancel(ctx.Done(), s.currentCondition().Latency); err != nil {
+		record.fail()
 		return nil, err
 	}
 
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
 	conn, err := dialer.DialContext(ctx, network, addr)
 	if err != nil {
+		record.fail()
 		return nil, err
 	}
+	record.connect()
 	return &shapedConn{
 		Conn:             conn,
 		currentCondition: s.currentCondition,
 		stats:            &s.stats,
+		record:           record,
 		closed:           make(chan struct{}),
 	}, nil
+}
+
+// recordConnection adds a connection to the request log.
+func (s *Server) recordConnection(destination string) *connectionRecord {
+	record := &connectionRecord{destination: destination, openedAt: time.Now()}
+	s.recentMu.Lock()
+	defer s.recentMu.Unlock()
+	s.recent = append(s.recent, record)
+	if len(s.recent) > recentConnectionLimit {
+		s.recent = s.recent[len(s.recent)-recentConnectionLimit:]
+	}
+	return record
+}
+
+// RecentConnections returns the request log, newest first.
+func (s *Server) RecentConnections() []Connection {
+	s.recentMu.Lock()
+	records := append([]*connectionRecord(nil), s.recent...)
+	s.recentMu.Unlock()
+
+	now := time.Now()
+	connections := make([]Connection, len(records))
+	for index, record := range records {
+		connections[len(records)-1-index] = record.snapshot(now)
+	}
+	return connections
 }
 
 // Stop stops accepting connections.
@@ -272,6 +320,7 @@ type shapedConn struct {
 	net.Conn
 	currentCondition func() sim.Condition
 	stats            *Stats
+	record           *connectionRecord
 	closed           chan struct{} // Closed by Close, so a stalled read or write gives up.
 	closeOnce        sync.Once
 }
@@ -284,6 +333,7 @@ func (c *shapedConn) Read(b []byte) (int, error) {
 			return 0, waitErr
 		}
 		atomic.AddInt64(&c.stats.BytesRecv, int64(n))
+		c.record.bytesReceived.Add(int64(n))
 	}
 	return n, err
 }
@@ -295,18 +345,22 @@ func (c *shapedConn) Write(b []byte) (int, error) {
 	}
 	n, err := c.Conn.Write(b)
 	atomic.AddInt64(&c.stats.BytesSent, int64(n))
+	c.record.bytesSent.Add(int64(n))
 	return n, err
 }
 
 // Close also releases any read or write that is waiting for service.
 func (c *shapedConn) Close() error {
-	c.closeOnce.Do(func() { close(c.closed) })
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		c.record.close()
+	})
 	return c.Conn.Close()
 }
 
 // delay waits for service, then for the latency.
 func (c *shapedConn) delay() error {
-	if err := waitForService(c.closed, c.currentCondition); err != nil {
+	if err := waitForService(c.closed, c.currentCondition, c.record); err != nil {
 		return err
 	}
 	return sleepWithCancel(c.closed, c.currentCondition().Latency)
@@ -354,7 +408,13 @@ func (queue *connectionQueue) Addr() net.Addr {
 var errConnectionClosed = errors.New("connection closed while waiting for service")
 
 // waitForService returns when the condition is connected, or an error when cancel closes first.
-func waitForService(cancel <-chan struct{}, currentCondition func() sim.Condition) error {
+// The record counts the wait as a stall.
+func waitForService(cancel <-chan struct{}, currentCondition func() sim.Condition, record *connectionRecord) error {
+	if currentCondition().IsConnected {
+		return nil
+	}
+	record.startWaiting()
+	defer record.stopWaiting()
 	for !currentCondition().IsConnected {
 		if err := sleepWithCancel(cancel, blackoutPollInterval); err != nil {
 			return err
@@ -375,4 +435,84 @@ func sleepWithCancel(cancel <-chan struct{}, duration time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// Connection is one connection to a destination, as the request log shows it.
+type Connection struct {
+	Destination   string    // host:port, as the client asked for it.
+	OpenedAt      time.Time // When the client asked for the connection.
+	IsConnected   bool      // The dial finished. False while it waits for service, or after it failed.
+	HasFailed     bool      // The dial failed, or the client gave up while it waited for service.
+	IsClosed      bool
+	IsWaiting     bool          // Waiting for service right now: the dial, or data held back.
+	Stalled       time.Duration // Total time spent waiting for service, including now.
+	BytesSent     int64
+	BytesReceived int64
+}
+
+// connectionRecord is the live state behind a Connection. The byte counters change with every
+// read and write, so they are atomic; the other fields change rarely and use mu.
+type connectionRecord struct {
+	destination   string
+	openedAt      time.Time
+	bytesSent     atomic.Int64
+	bytesReceived atomic.Int64
+
+	mu           sync.Mutex
+	isConnected  bool
+	hasFailed    bool
+	isClosed     bool
+	stalled      time.Duration // Finished waits only.
+	waitingSince time.Time     // Zero when not waiting.
+}
+
+func (record *connectionRecord) connect() {
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	record.isConnected = true
+}
+
+func (record *connectionRecord) fail() {
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	record.hasFailed = true
+}
+
+func (record *connectionRecord) close() {
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	record.isClosed = true
+}
+
+func (record *connectionRecord) startWaiting() {
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	record.waitingSince = time.Now()
+}
+
+func (record *connectionRecord) stopWaiting() {
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	record.stalled += time.Since(record.waitingSince)
+	record.waitingSince = time.Time{}
+}
+
+func (record *connectionRecord) snapshot(now time.Time) Connection {
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	connection := Connection{
+		Destination:   record.destination,
+		OpenedAt:      record.openedAt,
+		IsConnected:   record.isConnected,
+		HasFailed:     record.hasFailed,
+		IsClosed:      record.isClosed,
+		IsWaiting:     !record.waitingSince.IsZero(),
+		Stalled:       record.stalled,
+		BytesSent:     record.bytesSent.Load(),
+		BytesReceived: record.bytesReceived.Load(),
+	}
+	if connection.IsWaiting {
+		connection.Stalled += now.Sub(record.waitingSince)
+	}
+	return connection
 }

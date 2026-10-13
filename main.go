@@ -135,7 +135,7 @@ func runTerminalUI() {
 	}
 	defer proxyServer.Stop()
 
-	program := tea.NewProgram(tui.NewModel(ride, proxyServer.Port()), tea.WithAltScreen())
+	program := tea.NewProgram(tui.NewModel(ride, proxyServer), tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running TUI: %v\n", err)
 		os.Exit(1)
