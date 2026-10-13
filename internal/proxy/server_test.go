@@ -3,6 +3,9 @@ package proxy
 import (
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -144,5 +147,36 @@ func TestDialWaitsForService(t *testing.T) {
 	}
 	if _, err := conn.Write([]byte("ok")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// HTTP clients use the same port: CONNECT for https:// URLs, and a plain request with the full URL
+// for http:// URLs.
+func TestHTTPProxy(t *testing.T) {
+	currentCondition, _ := switchableCondition()
+	server := startProxy(t, currentCondition)
+	proxyURL := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(server.Port()))}
+
+	handler := http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(writer, "through the proxy")
+	})
+	for _, destination := range []*httptest.Server{httptest.NewServer(handler), httptest.NewTLSServer(handler)} {
+		t.Cleanup(destination.Close)
+		client := destination.Client()
+		client.Transport.(*http.Transport).Proxy = http.ProxyURL(proxyURL)
+		client.Timeout = 2 * time.Second
+
+		response, err := client.Get(destination.URL)
+		if err != nil {
+			t.Fatalf("GET %s: %v", destination.URL, err)
+		}
+		body, err := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if err != nil || string(body) != "through the proxy" {
+			t.Fatalf("GET %s: body %q, error %v", destination.URL, body, err)
+		}
+	}
+	if connections := server.GetStats().Connections; connections < 2 {
+		t.Fatalf("proxy saw %d connections; want both requests to go through it", connections)
 	}
 }

@@ -19,8 +19,8 @@ import (
 
 const usage = `Train-Gap: NYC Subway Network Simulator
 
-A SOCKS5 proxy that rides an NYC subway line. Route your traffic through it to test
-how your app handles signal loss between stations, stalls, and slow recovery.
+A proxy (SOCKS5 and HTTP on one port) that rides an NYC subway line. Route your traffic
+through it to test how your app handles signal loss between stations, stalls, and slow recovery.
 Stations have service; tunnels without coverage stall connections until the next station.
 
 Usage:
@@ -36,7 +36,7 @@ Examples:
   train-gap --line 3 --speed 4              # 3 train, four times real time
   train-gap run --speed 4 -- npm test       # run your tests on the L train
   train-gap --replay ride.ndjson            # replay a ride recorded with the iPhone recorder
-  curl --proxy socks5://localhost:1080 https://example.com
+  curl --proxy http://localhost:1080 https://example.com
 
 Lines: %v
 `
@@ -54,7 +54,7 @@ func addRideFlags(flags *flag.FlagSet, defaultPort int) rideOptions {
 	return rideOptions{
 		lineID:     flags.String("line", "L", "subway line to ride"),
 		replayPath: flags.String("replay", "", "replay a ride recorded with the iPhone recorder (.ndjson) instead of the line model"),
-		port:       flags.Int("port", defaultPort, "SOCKS5 proxy port (0 picks a free port)"),
+		port:       flags.Int("port", defaultPort, "proxy port, SOCKS5 and HTTP (0 picks a free port)"),
 		speed:      flags.Float64("speed", 1.0, "simulation speed, 0.1 to 10 (1 is real time)"),
 		isPaused:   flags.Bool("manual", false, "start paused; press n to step through stops and runs"),
 	}
@@ -171,12 +171,13 @@ func runCommand(arguments []string) int {
 	}
 	defer proxyServer.Stop()
 
-	// curl, Go, and most CLI tools read these. Node's fetch and Python's requests (without PySocks)
-	// do not speak SOCKS5; route those through a SOCKS-aware agent.
-	proxyURL := fmt.Sprintf("socks5://127.0.0.1:%d", proxyServer.Port())
+	// The proxy speaks SOCKS5 and HTTP on one port. An http:// URL works with the most clients:
+	// curl, Go, Python's requests, pip, npm, git, and Node (with NODE_USE_ENV_PROXY, Node 22.21+
+	// and 24.5+). Clients skip the proxy for hosts in NO_PROXY; Go always skips localhost.
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", proxyServer.Port())
 	child := exec.Command(command[0], command[1:]...)
 	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
-	child.Env = os.Environ()
+	child.Env = append(os.Environ(), "NODE_USE_ENV_PROXY=1")
 	for _, name := range []string{"ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"} {
 		child.Env = append(child.Env, name+"="+proxyURL)
 	}

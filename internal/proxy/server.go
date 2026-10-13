@@ -1,13 +1,17 @@
-// Package proxy is a SOCKS5 proxy that applies the simulated network condition to every connection.
+// Package proxy is a SOCKS5 and HTTP proxy that applies the simulated network condition to every
+// connection.
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httputil"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,12 +31,16 @@ type Stats struct {
 	BytesRecv   int64
 }
 
-// Server is a SOCKS5 proxy on 127.0.0.1 that shapes traffic with the current condition.
+// Server is a proxy on 127.0.0.1 that shapes traffic with the current condition. One port speaks
+// both SOCKS5 and HTTP (CONNECT, and plain requests with a full URL), because many clients only
+// support one of the two: Node's fetch and Python's requests only use an http:// proxy.
 type Server struct {
 	port             int
 	currentCondition func() sim.Condition
 	listener         net.Listener
-	server           *socks5.Server
+	socksServer      *socks5.Server
+	httpServer       *http.Server
+	httpConnections  *connectionQueue // Accepted connections that start with an HTTP request.
 	stats            Stats
 	running          bool
 	mu               sync.Mutex
@@ -59,11 +67,11 @@ func (s *Server) Start() error {
 		Logger: log.New(io.Discard, "", 0),
 	}
 
-	server, err := socks5.New(conf)
+	socksServer, err := socks5.New(conf)
 	if err != nil {
 		return fmt.Errorf("failed to create SOCKS5 server: %w", err)
 	}
-	s.server = server
+	s.socksServer = socksServer
 
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", s.port))
 	if err != nil {
@@ -75,8 +83,29 @@ func (s *Server) Start() error {
 			s.port = addr.Port
 		}
 	}
-	s.running = true
 
+	s.httpConnections = &connectionQueue{connections: make(chan net.Conn), closed: make(chan struct{}), address: listener.Addr()}
+	forwarder := &httputil.ReverseProxy{
+		// A proxy request names its destination in the URL, so there is nothing to rewrite.
+		Rewrite: func(*httputil.ProxyRequest) {},
+		// Proxy is nil: the forwarder must not send requests back through a proxy from the environment.
+		Transport: &http.Transport{DialContext: s.shapedDial},
+		ErrorLog:  log.New(io.Discard, "", 0),
+	}
+	s.httpServer = &http.Server{
+		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if request.Method == http.MethodConnect {
+				s.serveConnect(writer, request)
+				return
+			}
+			forwarder.ServeHTTP(writer, request)
+		}),
+		ErrorLog: log.New(io.Discard, "", 0),
+	}
+	// Serve returns when Stop closes the queue; the error only says that.
+	go func() { _ = s.httpServer.Serve(s.httpConnections) }()
+
+	s.running = true
 	go s.acceptLoop()
 	return nil
 }
@@ -117,13 +146,71 @@ func (s *Server) acceptLoop() {
 
 		backoff = 0
 		atomic.AddInt64(&s.stats.Connections, 1)
-
-		go func(c net.Conn) {
-			// The error only says how the client's connection ended; a stall that the client
-			// gave up on is expected behavior, not a proxy failure.
-			_ = s.server.ServeConn(c)
-		}(conn)
+		go s.serveConnection(conn)
 	}
+}
+
+// The first byte of a SOCKS5 greeting is the protocol version. An HTTP request starts with a letter.
+const socks5Version = 0x05
+
+// serveConnection reads the first byte to tell SOCKS5 from HTTP, then hands the connection over.
+func (s *Server) serveConnection(conn net.Conn) {
+	reader := bufio.NewReader(conn)
+	firstByte, err := reader.Peek(1)
+	if err != nil {
+		_ = conn.Close() // The client left before it sent anything.
+		return
+	}
+	peeked := &peekedConn{Conn: conn, reader: reader}
+	if firstByte[0] == socks5Version {
+		// The error only says how the client's connection ended; a stall that the client
+		// gave up on is expected behavior, not a proxy failure.
+		_ = s.socksServer.ServeConn(peeked)
+		return
+	}
+	select {
+	case s.httpConnections.connections <- peeked:
+	case <-s.httpConnections.closed:
+		_ = conn.Close()
+	}
+}
+
+// serveConnect opens a tunnel for an HTTP CONNECT request: it dials the destination like SOCKS5
+// does, answers 200, and copies bytes both ways.
+func (s *Server) serveConnect(writer http.ResponseWriter, request *http.Request) {
+	destination, err := s.shapedDial(request.Context(), "tcp", request.Host)
+	if err != nil {
+		http.Error(writer, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer destination.Close()
+
+	hijacker, ok := writer.(http.Hijacker)
+	if !ok {
+		http.Error(writer, "the connection cannot be taken over", http.StatusInternalServerError)
+		return
+	}
+	client, buffered, err := hijacker.Hijack()
+	if err != nil {
+		return // The client is gone.
+	}
+	defer client.Close()
+	if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		return
+	}
+
+	// ponytail: when either side ends, both close. A client that half-closes and still waits for
+	// data would lose the rest; TLS clients do not do that. Add CloseWrite handling if one does.
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(destination, buffered.Reader) // The reader holds any bytes sent after CONNECT.
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(client, destination)
+		done <- struct{}{}
+	}()
+	<-done
 }
 
 // shapedDial opens the connection to the destination the way a phone would: it waits for
@@ -159,10 +246,9 @@ func (s *Server) Stop() error {
 	}
 
 	s.running = false
-	if s.listener != nil {
-		return s.listener.Close()
-	}
-	return nil
+	// Close only says that the queue was already closed; the listener error below is the one to report.
+	_ = s.httpServer.Close()
+	return s.listener.Close()
 }
 
 // GetStats returns proxy statistics
@@ -224,6 +310,44 @@ func (c *shapedConn) delay() error {
 		return err
 	}
 	return sleepWithCancel(c.closed, c.currentCondition().Latency)
+}
+
+// peekedConn is a client connection whose first bytes were read to choose the protocol.
+// Reads come from the buffer first.
+type peekedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (conn *peekedConn) Read(b []byte) (int, error) {
+	return conn.reader.Read(b)
+}
+
+// connectionQueue is a net.Listener for connections that are already accepted. The HTTP server
+// takes the connections that start with an HTTP request from it.
+type connectionQueue struct {
+	connections chan net.Conn
+	closed      chan struct{}
+	closeOnce   sync.Once
+	address     net.Addr
+}
+
+func (queue *connectionQueue) Accept() (net.Conn, error) {
+	select {
+	case conn := <-queue.connections:
+		return conn, nil
+	case <-queue.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (queue *connectionQueue) Close() error {
+	queue.closeOnce.Do(func() { close(queue.closed) })
+	return nil
+}
+
+func (queue *connectionQueue) Addr() net.Addr {
+	return queue.address
 }
 
 // errConnectionClosed ends a wait when the connection closes.

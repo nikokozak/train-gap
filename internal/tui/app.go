@@ -446,7 +446,7 @@ func (m Model) viewFooter(w int) string {
 	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#555"))
 	accent := lipgloss.NewStyle().Foreground(lipgloss.Color("#888"))
 
-	proxyAddr := accent.Render(fmt.Sprintf("socks5://localhost:%d", m.proxyPort))
+	proxyAddr := accent.Render(fmt.Sprintf("proxy localhost:%d", m.proxyPort))
 
 	// Mode and speed are both shown, so a paused ride still says how fast it will run.
 	var mode string
