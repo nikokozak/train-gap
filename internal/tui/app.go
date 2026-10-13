@@ -450,8 +450,11 @@ func (m Model) viewFooter(w int) string {
 
 	// Mode and speed are both shown, so a paused ride still says how fast it will run.
 	var mode string
+	if recordedAt := m.ride.Timeline.RecordedAt; !recordedAt.IsZero() {
+		mode = accent.Render("REPLAY " + recordedAt.Local().Format("Jan 2 15:04"))
+	}
 	if m.ride.IsPaused() {
-		mode = lipgloss.NewStyle().Foreground(ColorDegrading).Bold(true).Render("PAUSED")
+		mode = strings.TrimSpace(mode + " " + lipgloss.NewStyle().Foreground(ColorDegrading).Bold(true).Render("PAUSED"))
 	}
 	if speed := m.ride.Speed(); speed != 1.0 {
 		mode = strings.TrimSpace(mode + " " + dim.Render(fmt.Sprintf("%.1fx", speed)))
@@ -466,9 +469,7 @@ func (m Model) viewFooter(w int) string {
 	if mode != "" {
 		gap = gap - lipgloss.Width(mode) - 2
 	}
-	if gap < 1 {
-		gap = 1
-	}
+	gap = max(gap, 2) // At least one space on each side of the mode.
 
 	var line string
 	if mode != "" {

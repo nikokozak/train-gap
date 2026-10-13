@@ -29,6 +29,7 @@ func TestConditionAt(t *testing.T) {
 	connected := Condition{IsConnected: true, Latency: serviceLatency}
 	weak := Condition{IsConnected: true, Latency: weakSignalLatency}
 	blackout := Condition{IsConnected: false}
+	recorded := Phase{Kind: AtStation, Duration: 3 * time.Second, Recorded: []Condition{connected, blackout, connected}}
 
 	tests := []struct {
 		name   string
@@ -45,6 +46,8 @@ func TestConditionAt(t *testing.T) {
 		{"service back but weak", tunnel, 37 * time.Second, weak},
 		{"approaching the station", tunnel, 50 * time.Second, connected},
 		{"a tunnel too short to lose service", shortTunnel, 15 * time.Second, weak},
+		{"a recorded second", recorded, 1500 * time.Millisecond, blackout},
+		{"past the recording: the last second", recorded, 5 * time.Second, connected},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

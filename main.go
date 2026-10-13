@@ -12,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/nikokozak/train-gap/internal/lines"
 	"github.com/nikokozak/train-gap/internal/proxy"
+	"github.com/nikokozak/train-gap/internal/recording"
 	"github.com/nikokozak/train-gap/internal/sim"
 	"github.com/nikokozak/train-gap/internal/tui"
 )
@@ -34,6 +35,7 @@ Examples:
   train-gap                                 # L train, proxy on port 1080
   train-gap --line 3 --speed 4              # 3 train, four times real time
   train-gap run --speed 4 -- npm test       # run your tests on the L train
+  train-gap --replay ride.ndjson            # replay a ride recorded with the iPhone recorder
   curl --proxy socks5://localhost:1080 https://example.com
 
 Lines: %v
@@ -41,30 +43,66 @@ Lines: %v
 
 // rideOptions are the flags shared by both modes.
 type rideOptions struct {
-	lineID   *string
-	port     *int
-	speed    *float64
-	isPaused *bool
+	lineID     *string
+	replayPath *string
+	port       *int
+	speed      *float64
+	isPaused   *bool
 }
 
 func addRideFlags(flags *flag.FlagSet, defaultPort int) rideOptions {
 	return rideOptions{
-		lineID:   flags.String("line", "L", "subway line to ride"),
-		port:     flags.Int("port", defaultPort, "SOCKS5 proxy port (0 picks a free port)"),
-		speed:    flags.Float64("speed", 1.0, "simulation speed, 0.1 to 10 (1 is real time)"),
-		isPaused: flags.Bool("manual", false, "start paused; press n to step through stops and runs"),
+		lineID:     flags.String("line", "L", "subway line to ride"),
+		replayPath: flags.String("replay", "", "replay a ride recorded with the iPhone recorder (.ndjson) instead of the line model"),
+		port:       flags.Int("port", defaultPort, "SOCKS5 proxy port (0 picks a free port)"),
+		speed:      flags.Float64("speed", 1.0, "simulation speed, 0.1 to 10 (1 is real time)"),
+		isPaused:   flags.Bool("manual", false, "start paused; press n to step through stops and runs"),
 	}
 }
 
 func (options rideOptions) newRide() (*sim.Ride, error) {
-	line := lines.Get(*options.lineID)
-	if line == nil {
-		return nil, fmt.Errorf("unknown line %q; lines: %v", *options.lineID, lines.IDs())
+	line, timeline, err := options.timeline()
+	if err != nil {
+		return nil, err
 	}
-	ride := sim.NewRide(line)
+	ride := sim.NewRide(line, timeline)
 	ride.SetSpeed(*options.speed)
 	ride.SetPaused(*options.isPaused)
 	return ride, nil
+}
+
+// timeline returns the line and what to play on it: the recording given by --replay, or else the
+// model of --line.
+func (options rideOptions) timeline() (*lines.Line, sim.Timeline, error) {
+	if *options.replayPath == "" {
+		line := lines.Get(*options.lineID)
+		if line == nil {
+			return nil, sim.Timeline{}, fmt.Errorf("unknown line %q; lines: %v", *options.lineID, lines.IDs())
+		}
+		return line, sim.NewTimeline(line), nil
+	}
+
+	recorded, err := recording.Read(*options.replayPath)
+	if err != nil {
+		return nil, sim.Timeline{}, err
+	}
+	line := lines.Get(recorded.Start.LineID)
+	if line == nil {
+		return nil, sim.Timeline{}, fmt.Errorf("%s: line %q is not in the station dataset", *options.replayPath, recorded.Start.LineID)
+	}
+	timeline, err := recording.Timeline(recorded, line)
+	if err != nil {
+		return nil, sim.Timeline{}, fmt.Errorf("%s: %w", *options.replayPath, err)
+	}
+	return line, timeline, nil
+}
+
+// describeRide says what plays: "riding the L train" or "replaying the 3 train ride of 2026-10-13 09:19".
+func describeRide(ride *sim.Ride) string {
+	if ride.Timeline.RecordedAt.IsZero() {
+		return fmt.Sprintf("riding the %s train", ride.Line.ID)
+	}
+	return fmt.Sprintf("replaying the %s train ride of %s", ride.Line.ID, ride.Timeline.RecordedAt.Local().Format("2006-01-02 15:04"))
 }
 
 func main() {
@@ -143,7 +181,7 @@ func runCommand(arguments []string) int {
 		child.Env = append(child.Env, name+"="+proxyURL)
 	}
 
-	fmt.Fprintf(os.Stderr, "train-gap: riding the %s train; proxy %s\n", ride.Line.ID, proxyURL)
+	fmt.Fprintf(os.Stderr, "train-gap: %s; proxy %s\n", describeRide(ride), proxyURL)
 	stopLogging := make(chan struct{})
 	go logRide(ride, os.Stderr, stopLogging)
 	err = child.Run()

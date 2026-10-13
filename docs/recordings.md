@@ -87,9 +87,18 @@ go run ./cmd/recording-summarize -energy -- path/to/session.ndjson > energy.csv
 
 Each row is one second: the jolt, the smoothed jolt, the jolt relative to the ride's typical level (stops are well below 1), service (`1` a probe got through, `0` probes failed), and `mark=1` where you tapped Mark. The flags `-min-stop-s`, `-min-segment-s`, `-smooth-s`, and `-tunnel-gap-s` change the limits.
 
-## Next processing step (how Train-Gap can use it)
+## Replay a ride
 
-Not built yet: the simulator replaying a recording. The labelled segments and stops, with their probe statistics, would become its timeline: per segment, the share of successful probes and the round-trip times of the successful ones. Today the simulator uses a model whose timings come from these recordings (see `internal/sim/timeline.go`).
+```bash
+train-gap --replay path/to/session.ndjson
+train-gap run --replay path/to/session.ndjson -- npm test
+```
+
+The simulator finds the stops as above and then plays the ride as it was recorded. Each second gets the result of the probe that started in it:
+- A failed probe is a second without service. Connections stall through it.
+- A successful probe sets the added delay to half its round-trip time. A probe on a new connection includes TCP and TLS setup, so it counts as three round trips.
+
+After the end station, the ride starts again. Replay needs stops, so the stop detection status must be `matched`, `motion_only`, or `unverified_end`.
 
 ## Station dataset
 

@@ -30,9 +30,9 @@ type Ride struct {
 	now           func() time.Time // Tests replace it.
 }
 
-// NewRide starts a ride on the line at its first station, at normal speed.
-func NewRide(line *lines.Line) *Ride {
-	ride := &Ride{Line: line, Timeline: NewTimeline(line), speed: 1, now: time.Now}
+// NewRide starts playing the timeline from its first phase, at normal speed.
+func NewRide(line *lines.Line, timeline Timeline) *Ride {
+	ride := &Ride{Line: line, Timeline: timeline, speed: 1, now: time.Now}
 	ride.anchorWall = ride.now()
 	return ride
 }

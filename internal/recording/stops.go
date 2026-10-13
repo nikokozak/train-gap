@@ -1,4 +1,4 @@
-package main
+package recording
 
 import (
 	"math"
@@ -25,19 +25,20 @@ import (
 // hand and Mark taps, one in a pocket. Fixed motion thresholds failed on those rides because the
 // jolt level depends on where the phone is. Tune the flags with the -energy trace.
 
-// detectionSettings are the tuning knobs. Each one has a command-line flag.
-type detectionSettings struct {
-	minimumStopSeconds      int // A shorter quiet stretch is a slowdown, not a stop. Brooklyn 3-train dwells were 6-25 s.
-	minimumSegmentSeconds   int // Shortest ride between two stations.
-	smoothingSeconds        int // Width of the rolling median, in one-second batches.
-	minimumTunnelGapSeconds int // Failed probes for at least this long count as one tunnel.
+// Settings are the tuning knobs. Each one has a recording-summarize flag.
+type Settings struct {
+	MinimumStopSeconds      int // A shorter quiet stretch is a slowdown, not a stop. Brooklyn 3-train dwells were 6-25 s.
+	MinimumSegmentSeconds   int // Shortest ride between two stations.
+	SmoothingSeconds        int // Width of the rolling median, in one-second batches.
+	MinimumTunnelGapSeconds int // Failed probes for at least this long count as one tunnel.
 }
 
-var defaultDetectionSettings = detectionSettings{
-	minimumStopSeconds:      3,
-	minimumSegmentSeconds:   20,
-	smoothingSeconds:        3,
-	minimumTunnelGapSeconds: 10,
+// DefaultSettings fit both calibration rides.
+var DefaultSettings = Settings{
+	MinimumStopSeconds:      3,
+	MinimumSegmentSeconds:   20,
+	SmoothingSeconds:        3,
+	MinimumTunnelGapSeconds: 10,
 }
 
 // The recorder writes one motion batch per second.
@@ -68,26 +69,16 @@ const markToleranceMS = 3000
 
 // Outcomes, written to the summary as stop_detection.status.
 const (
-	statusMatched      = "matched"        // Tunnel gaps confirm the segment count; motion places the stops.
-	statusMotionOnly   = "motion_only"    // Tunnel gaps did not match the count (wired tunnel, elevated track, express run). Check the stops.
-	statusUnverified   = "unverified_end" // The rider chose "Not sure"; the tunnel gaps give the count.
-	statusCountUnknown = "count_unknown"  // "Not sure", and the tunnel gaps do not give a count either.
-	statusNoFit        = "no_fit"         // No split fits the time limits; check the end station.
-	statusNoMotion     = "no_motion"      // The recording has no motion data.
+	StatusMatched      = "matched"        // Tunnel gaps confirm the segment count; motion places the stops.
+	StatusMotionOnly   = "motion_only"    // Tunnel gaps did not match the count (wired tunnel, elevated track, express run). Check the stops.
+	StatusUnverified   = "unverified_end" // The rider chose "Not sure"; the tunnel gaps give the count.
+	StatusCountUnknown = "count_unknown"  // "Not sure", and the tunnel gaps do not give a count either.
+	StatusNoFit        = "no_fit"         // No split fits the time limits; check the end station.
+	StatusNoMotion     = "no_motion"      // The recording has no motion data.
 )
 
-// motionBatch is one `motion` event: about one second of accelerometer readings
-// without gravity, in milli-g.
-type motionBatch struct {
-	TMS     int64 `json:"t_ms"`
-	Hz      int   `json:"hz"`
-	XMilliG []int `json:"x_mg"`
-	YMilliG []int `json:"y_mg"`
-	ZMilliG []int `json:"z_mg"`
-}
-
 // joltMilliG is the RMS change between consecutive readings in the batch.
-func (batch motionBatch) joltMilliG() float64 {
+func (batch MotionBatch) joltMilliG() float64 {
 	readingCount := min(len(batch.XMilliG), len(batch.YMilliG), len(batch.ZMilliG))
 	if readingCount < 2 {
 		return 0
@@ -102,79 +93,77 @@ func (batch motionBatch) joltMilliG() float64 {
 	return math.Sqrt(sumOfSquares / float64(readingCount-1))
 }
 
-// secondOfRide is one motion batch with the evidence for that second.
-type secondOfRide struct {
-	startMS        int64
-	joltMilliG     float64
-	smoothedMilliG float64
-	relativeJolt   float64 // smoothedMilliG divided by the ride's median, capped at maximumRelativeJolt.
-	hasProbe       bool
-	hasService     bool
+// SecondOfRide is one motion batch with the evidence for that second.
+type SecondOfRide struct {
+	StartMS        int64
+	JoltMilliG     float64
+	SmoothedMilliG float64
+	RelativeJolt   float64 // SmoothedMilliG divided by the ride's median, capped at maximumRelativeJolt.
+	HasProbe       bool
+	HasService     bool
 }
 
 // stopCost is low where a stop is likely: the phone is quiet and probes get through.
-func (second secondOfRide) stopCost() float64 {
-	if second.hasProbe && !second.hasService {
-		return second.relativeJolt + noServiceStopPenalty
+func (second SecondOfRide) stopCost() float64 {
+	if second.HasProbe && !second.HasService {
+		return second.RelativeJolt + noServiceStopPenalty
 	}
-	return second.relativeJolt
+	return second.RelativeJolt
 }
 
 // moveCost is low where the train is likely moving: the phone jolts at least as hard as usual.
-func (second secondOfRide) moveCost() float64 {
-	return max(0, 1-second.relativeJolt)
+func (second SecondOfRide) moveCost() float64 {
+	return max(0, 1-second.RelativeJolt)
 }
 
-// timeSpan is a half-open span of time: [startMS, endMS).
-type timeSpan struct {
-	startMS int64
-	endMS   int64
+// TimeSpan is a half-open span of time: [StartMS, EndMS).
+type TimeSpan struct {
+	StartMS int64
+	EndMS   int64
 }
 
-// movingRun is the time the train moved between two stops.
-type movingRun = timeSpan
-
-// readSecondsOfRide combines motion and probes into one value per second, in time order.
-// Batches that start after stopMS (when the rider tapped Stop) are ignored.
-func readSecondsOfRide(batches []motionBatch, samples []sample, stopMS int64, settings detectionSettings) []secondOfRide {
-	var seconds []secondOfRide
-	for _, batch := range batches {
-		if batch.TMS <= stopMS {
-			seconds = append(seconds, secondOfRide{startMS: batch.TMS, joltMilliG: batch.joltMilliG()})
+// SecondsOfRide combines motion and probes into one value per second, in time order, up to the
+// end of the ride. The -energy trace prints it.
+func SecondsOfRide(recording Recording, settings Settings) []SecondOfRide {
+	endMS := recording.EndMS()
+	var seconds []SecondOfRide
+	for _, batch := range recording.Motion {
+		if batch.TMS <= endMS {
+			seconds = append(seconds, SecondOfRide{StartMS: batch.TMS, JoltMilliG: batch.joltMilliG()})
 		}
 	}
-	sort.Slice(seconds, func(i, j int) bool { return seconds[i].startMS < seconds[j].startMS })
+	sort.Slice(seconds, func(i, j int) bool { return seconds[i].StartMS < seconds[j].StartMS })
 	if len(seconds) == 0 {
 		return nil
 	}
 
 	// A rolling median removes single bumps without blurring the start of a stop.
-	halfWindow := settings.smoothingSeconds / 2
+	halfWindow := settings.SmoothingSeconds / 2
 	smoothedValues := make([]float64, len(seconds))
 	for index := range seconds {
-		window := make([]float64, 0, settings.smoothingSeconds)
+		window := make([]float64, 0, settings.SmoothingSeconds)
 		for windowIndex := max(0, index-halfWindow); windowIndex < min(len(seconds), index+halfWindow+1); windowIndex++ {
-			window = append(window, seconds[windowIndex].joltMilliG)
+			window = append(window, seconds[windowIndex].JoltMilliG)
 		}
-		seconds[index].smoothedMilliG = median(window)
-		smoothedValues[index] = seconds[index].smoothedMilliG
+		seconds[index].SmoothedMilliG = median(window)
+		smoothedValues[index] = seconds[index].SmoothedMilliG
 	}
 
 	// The train runs most of the ride, so the median is the usual running level for this phone position.
 	rideLevel := median(smoothedValues)
 	successBySecond := map[int64]bool{} // Second -> any probe that started in it succeeded.
-	for _, s := range samples {
-		successBySecond[s.TMS/1000] = successBySecond[s.TMS/1000] || s.Probe.OK
+	for _, sample := range recording.Samples {
+		successBySecond[sample.TMS/1000] = successBySecond[sample.TMS/1000] || sample.Probe.OK
 	}
 	for index := range seconds {
 		if rideLevel > 0 {
-			seconds[index].relativeJolt = min(seconds[index].smoothedMilliG/rideLevel, maximumRelativeJolt)
+			seconds[index].RelativeJolt = min(seconds[index].SmoothedMilliG/rideLevel, maximumRelativeJolt)
 		}
-		centerSecond := seconds[index].startMS / 1000
+		centerSecond := seconds[index].StartMS / 1000
 		for second := centerSecond - serviceLookaroundMS/1000; second <= centerSecond+serviceLookaroundMS/1000; second++ {
 			succeeded, hasProbe := successBySecond[second]
-			seconds[index].hasProbe = seconds[index].hasProbe || hasProbe
-			seconds[index].hasService = seconds[index].hasService || succeeded
+			seconds[index].HasProbe = seconds[index].HasProbe || hasProbe
+			seconds[index].HasService = seconds[index].HasService || succeeded
 		}
 	}
 	return seconds
@@ -194,29 +183,29 @@ func median(values []float64) float64 {
 }
 
 // findTunnelGaps returns the stretches of failed probes that last at least
-// minimumTunnelGapSeconds, in time order. A short success inside failures does not split a gap.
-func findTunnelGaps(samples []sample, stopMS int64, settings detectionSettings) []timeSpan {
-	sorted := append([]sample(nil), samples...)
+// MinimumTunnelGapSeconds, in time order. A short success inside failures does not split a gap.
+func findTunnelGaps(samples []Sample, endMS int64, settings Settings) []TimeSpan {
+	sorted := append([]Sample(nil), samples...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].TMS < sorted[j].TMS })
 
-	var gaps []timeSpan
-	var current *timeSpan
+	var gaps []TimeSpan
+	var current *TimeSpan
 	keepCurrent := func() {
-		if current != nil && current.endMS-current.startMS >= int64(settings.minimumTunnelGapSeconds)*1000 {
+		if current != nil && current.EndMS-current.StartMS >= int64(settings.MinimumTunnelGapSeconds)*1000 {
 			gaps = append(gaps, *current)
 		}
 	}
-	for _, s := range sorted {
-		if s.TMS > stopMS || s.Probe.OK {
+	for _, sample := range sorted {
+		if sample.TMS > endMS || sample.Probe.OK {
 			continue
 		}
-		// endMS is one second after the last failure, so this is the time since that failure ended.
-		if current != nil && s.TMS-current.endMS <= maximumServiceBlipMS {
-			current.endMS = s.TMS + batchDurationMS
+		// EndMS is one second after the last failure, so this is the time since that failure ended.
+		if current != nil && sample.TMS-current.EndMS <= maximumServiceBlipMS {
+			current.EndMS = sample.TMS + batchDurationMS
 			continue
 		}
 		keepCurrent()
-		current = &timeSpan{startMS: s.TMS, endMS: s.TMS + batchDurationMS}
+		current = &TimeSpan{StartMS: sample.TMS, EndMS: sample.TMS + batchDurationMS}
 	}
 	keepCurrent()
 	return gaps
@@ -224,14 +213,14 @@ func findTunnelGaps(samples []sample, stopMS int64, settings detectionSettings) 
 
 // segmentRide splits the ride into exactly segmentCount moving runs separated by stops, choosing
 // the split with the lowest total cost. The stops at the start and end may have any length; the
-// others last minimumStopSeconds to maximumStopMS, and runs last minimumSegmentSeconds to
+// others last MinimumStopSeconds to maximumStopMS, and runs last MinimumSegmentSeconds to
 // maximumSegmentMS. When tunnelGaps is not nil, it has one gap per run, and run k must contain gap k.
 // It returns nil when no split fits.
 //
 // This is a dynamic program over boundary seconds. For each run k and second t it keeps the best
 // cost of the ride up to "run k departs at t" and up to "run k arrives at t".
 // Time: runs x seconds x seconds within the duration limits.
-func segmentRide(seconds []secondOfRide, segmentCount int, tunnelGaps []timeSpan, settings detectionSettings) []movingRun {
+func segmentRide(seconds []SecondOfRide, segmentCount int, tunnelGaps []TimeSpan, settings Settings) []TimeSpan {
 	secondCount := len(seconds)
 	if segmentCount < 1 || secondCount == 0 {
 		return nil
@@ -240,9 +229,9 @@ func segmentRide(seconds []secondOfRide, segmentCount int, tunnelGaps []timeSpan
 	// Boundary b is the start of seconds[b]; boundary secondCount is the end of the last second.
 	boundaryMS := func(boundary int) int64 {
 		if boundary == secondCount {
-			return seconds[secondCount-1].startMS + batchDurationMS
+			return seconds[secondCount-1].StartMS + batchDurationMS
 		}
-		return seconds[boundary].startMS
+		return seconds[boundary].StartMS
 	}
 	stopPrefix := make([]float64, secondCount+1)
 	movePrefix := make([]float64, secondCount+1)
@@ -259,15 +248,15 @@ func segmentRide(seconds []secondOfRide, segmentCount int, tunnelGaps []timeSpan
 		if tunnelGaps == nil {
 			return true
 		}
-		return boundary <= firstBoundaryAtOrAfter(tunnelGaps[run].startMS) &&
-			(run == 0 || boundary >= firstBoundaryAtOrAfter(tunnelGaps[run-1].endMS))
+		return boundary <= firstBoundaryAtOrAfter(tunnelGaps[run].StartMS) &&
+			(run == 0 || boundary >= firstBoundaryAtOrAfter(tunnelGaps[run-1].EndMS))
 	}
 	arrivalAllowed := func(run, boundary int) bool {
 		if tunnelGaps == nil {
 			return true
 		}
-		return boundary >= firstBoundaryAtOrAfter(tunnelGaps[run].endMS) &&
-			(run == segmentCount-1 || boundary <= firstBoundaryAtOrAfter(tunnelGaps[run+1].startMS))
+		return boundary >= firstBoundaryAtOrAfter(tunnelGaps[run].EndMS) &&
+			(run == segmentCount-1 || boundary <= firstBoundaryAtOrAfter(tunnelGaps[run+1].StartMS))
 	}
 
 	infinity := math.Inf(1)
@@ -291,8 +280,8 @@ func segmentRide(seconds []secondOfRide, segmentCount int, tunnelGaps []timeSpan
 	bestDepart, bestArrive := newTable(), newTable()
 	departFrom, arriveFrom := newLinks(), newLinks() // The arrival (or departure) boundary that led here.
 
-	minimumStopMS := int64(settings.minimumStopSeconds) * 1000
-	minimumSegmentMS := int64(settings.minimumSegmentSeconds) * 1000
+	minimumStopMS := int64(settings.MinimumStopSeconds) * 1000
+	minimumSegmentMS := int64(settings.MinimumSegmentSeconds) * 1000
 	for run := 0; run < segmentCount; run++ {
 		for departure := 0; departure <= secondCount; departure++ {
 			if !departureAllowed(run, departure) {
@@ -349,11 +338,11 @@ func segmentRide(seconds []secondOfRide, segmentCount int, tunnelGaps []timeSpan
 		return nil
 	}
 
-	runs := make([]movingRun, segmentCount)
+	runs := make([]TimeSpan, segmentCount)
 	arrival := finalArrival
 	for run := lastRun; run >= 0; run-- {
 		departure := arriveFrom[run][arrival]
-		runs[run] = movingRun{startMS: boundaryMS(departure), endMS: boundaryMS(arrival)}
+		runs[run] = TimeSpan{StartMS: boundaryMS(departure), EndMS: boundaryMS(arrival)}
 		if run > 0 {
 			arrival = departFrom[run][departure]
 		}
@@ -361,96 +350,74 @@ func segmentRide(seconds []secondOfRide, segmentCount int, tunnelGaps []timeSpan
 	return runs
 }
 
-// detectSegments finds the segments and stops in a recording, labels them from the route and
-// the end station, and adds the probe statistics for each one.
-func detectSegments(batches []motionBatch, marks []mark, samples []sample, route []routeStation, end sessionEnd, settings detectionSettings) ([]segmentSummary, []stopSummary, *stopDetection) {
-	detection := &stopDetection{Marks: len(marks)}
-	if len(batches) == 0 {
-		detection.Status = statusNoMotion
-		return nil, nil, detection
+// Detection is where the train moved during a recording.
+type Detection struct {
+	Status string
+	// Runs[k] is the train moving from route station k to route station k+1. The stops are the
+	// times between runs. Nil when the stops could not be found.
+	Runs []TimeSpan
+	// Stretches without service long enough to be a tunnel. On lines without tunnel coverage,
+	// one per segment.
+	TunnelGaps int
+	// Calibration check: marks should fall in detected stops (within 3 s), not inside runs.
+	MarksNearStops int
+}
+
+// DetectStops finds the runs between stations from the route, the end station, motion, and service.
+func DetectStops(recording Recording, settings Settings) Detection {
+	if len(recording.Motion) == 0 {
+		return Detection{Status: StatusNoMotion}
 	}
 
 	// Ignore everything after the rider tapped Stop; they are off the train by then.
-	stopMS := int64(math.MaxInt64)
-	if end.TMS != nil {
-		stopMS = *end.TMS
-	}
-	seconds := readSecondsOfRide(batches, samples, stopMS, settings)
-	tunnelGaps := findTunnelGaps(samples, stopMS, settings)
-	detection.TunnelGaps = len(tunnelGaps)
+	endMS := recording.EndMS()
+	seconds := SecondsOfRide(recording, settings)
+	tunnelGaps := findTunnelGaps(recording.Samples, endMS, settings)
+	detection := Detection{TunnelGaps: len(tunnelGaps)}
 
+	route := recording.Start.RouteStations
 	endPosition := -1
 	for position, station := range route {
-		if end.EndStationID != "" && station.ID == end.EndStationID {
+		if recording.End.EndStationID != "" && station.ID == recording.End.EndStationID {
 			endPosition = position
 		}
 	}
 
-	var runs []movingRun
 	switch {
 	case endPosition > 0 && len(tunnelGaps) == endPosition:
-		runs = segmentRide(seconds, endPosition, tunnelGaps, settings)
-		detection.Status = statusMatched
-		if runs == nil {
+		detection.Runs = segmentRide(seconds, endPosition, tunnelGaps, settings)
+		detection.Status = StatusMatched
+		if detection.Runs == nil {
 			// The gaps and the time limits disagree; fall back to motion and service alone.
-			runs = segmentRide(seconds, endPosition, nil, settings)
-			detection.Status = statusMotionOnly
+			detection.Runs = segmentRide(seconds, endPosition, nil, settings)
+			detection.Status = StatusMotionOnly
 		}
 	case endPosition > 0:
-		runs = segmentRide(seconds, endPosition, nil, settings)
-		detection.Status = statusMotionOnly
+		detection.Runs = segmentRide(seconds, endPosition, nil, settings)
+		detection.Status = StatusMotionOnly
 	case len(tunnelGaps) >= 1 && len(tunnelGaps) < len(route):
-		runs = segmentRide(seconds, len(tunnelGaps), tunnelGaps, settings)
-		detection.Status = statusUnverified
+		detection.Runs = segmentRide(seconds, len(tunnelGaps), tunnelGaps, settings)
+		detection.Status = StatusUnverified
 	default:
-		detection.Status = statusCountUnknown
-		return nil, nil, detection
+		detection.Status = StatusCountUnknown
+		return detection
 	}
-	if runs == nil {
-		detection.Status = statusNoFit
-		return nil, nil, detection
+	if detection.Runs == nil {
+		detection.Status = StatusNoFit
+		return detection
 	}
-	expectedSegments := len(runs)
-	detection.ExpectedSegments = &expectedSegments
-	detection.DetectedSegments = len(runs)
-
-	// Run k goes from route[k] to route[k+1]. Each stop is the time before a run; the last stop is
-	// where the rider got off.
-	recordingEndMS := seconds[len(seconds)-1].startMS + batchDurationMS
-	if end.TMS != nil {
-		recordingEndMS = *end.TMS
-	}
-	var segments []segmentSummary
-	var stops []stopSummary
-	previousEndMS := int64(0)
-	for position, run := range runs {
-		stops = append(stops, makeStop(route[position], previousEndMS, run.startMS, samples))
-		segments = append(segments, segmentSummary{
-			FromStationID:   route[position].ID,
-			FromStationName: route[position].Name,
-			ToStationID:     route[position+1].ID,
-			ToStationName:   route[position+1].Name,
-			DepartTMS:       run.startMS,
-			ArriveTMS:       run.endMS,
-			DurationMS:      run.endMS - run.startMS,
-			probeStats:      probeStatsBetween(samples, run.startMS, run.endMS),
-		})
-		previousEndMS = run.endMS
-	}
-	stops = append(stops, makeStop(route[len(runs)], previousEndMS, recordingEndMS, samples))
-
-	detection.MarksNearStops = countMarksNearStops(marks, runs)
-	return segments, stops, detection
+	detection.MarksNearStops = countMarksNearStops(recording.Marks, detection.Runs)
+	return detection
 }
 
 // countMarksNearStops is the calibration check: the rider taps Mark when the doors open, so with
 // good settings every mark falls in a stop, or within markToleranceMS of one.
-func countMarksNearStops(marks []mark, runs []movingRun) int {
+func countMarksNearStops(marks []Mark, runs []TimeSpan) int {
 	count := 0
-	for _, markEvent := range marks {
+	for _, mark := range marks {
 		insideRun := false
 		for _, run := range runs {
-			if markEvent.TMS >= run.startMS+markToleranceMS && markEvent.TMS < run.endMS-markToleranceMS {
+			if mark.TMS >= run.StartMS+markToleranceMS && mark.TMS < run.EndMS-markToleranceMS {
 				insideRun = true
 				break
 			}
@@ -460,15 +427,4 @@ func countMarksNearStops(marks []mark, runs []movingRun) int {
 		}
 	}
 	return count
-}
-
-func makeStop(station routeStation, startMS, endMS int64, samples []sample) stopSummary {
-	return stopSummary{
-		StationID:   station.ID,
-		StationName: station.Name,
-		StartTMS:    startMS,
-		EndTMS:      endMS,
-		DurationMS:  max(0, endMS-startMS),
-		probeStats:  probeStatsBetween(samples, startMS, endMS),
-	}
 }

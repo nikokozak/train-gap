@@ -1,103 +1,14 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"math"
 	"os"
 	"sort"
-	"strings"
+
+	"github.com/nikokozak/train-gap/internal/recording"
 )
-
-type sessionStart struct {
-	Type                      string   `json:"type"`
-	Version                   int      `json:"v"`
-	SessionID                 string   `json:"session_id"`
-	StartedAt                 string   `json:"started_at"`
-	LineID                    string   `json:"line_id"`
-	LineName                  string   `json:"line_name"`
-	FromStationID             string   `json:"from_station_id"`
-	FromStationName           string   `json:"from_station_name"`
-	ToStationID               string   `json:"to_station_id"`
-	ToStationName             string   `json:"to_station_name"`
-	Direction                 string   `json:"direction"`
-	DirectionLabel            string   `json:"direction_label"`
-	ProbeURL                  string   `json:"probe_url"`
-	ProbeURLs                 []string `json:"probe_urls"`
-	SampleIntervalMS          *int     `json:"sample_interval_ms"`
-	SampleIntervalInTransitMS *int     `json:"sample_interval_in_transit_ms"`
-	SampleIntervalAtStationMS *int     `json:"sample_interval_at_station_ms"`
-	// RouteStations lists the stations in ride order, starting at the start station.
-	// Recorder builds from 2026-10 write it; stop labels come from it.
-	RouteStations []routeStation `json:"route_stations"`
-}
-
-type routeStation struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-}
-
-// mark is a `mark` event: the rider tapped Mark (optional, usually when the doors open).
-type mark struct {
-	TMS int64 `json:"t_ms"`
-}
-
-type sample struct {
-	Type string `json:"type"`
-	TMS  int64  `json:"t_ms"`
-	Path struct {
-		Status      string  `json:"status"`
-		Interface   *string `json:"interface"`
-		Expensive   bool    `json:"expensive"`
-		Constrained bool    `json:"constrained"`
-	} `json:"path"`
-	Probe struct {
-		OK         bool    `json:"ok"`
-		URL        *string `json:"url"`
-		RTTMS      *int64  `json:"rtt_ms"`
-		HTTPStatus *int    `json:"http_status"`
-		Error      *string `json:"error"`
-	} `json:"probe"`
-}
-
-type stationDepart struct {
-	Type             string `json:"type"`
-	TMS              int64  `json:"t_ms"`
-	StationID        string `json:"station_id"`
-	StationName      string `json:"station_name"`
-	StationIndex     *int   `json:"station_index"`
-	NextStationID    string `json:"next_station_id"`
-	NextStationName  string `json:"next_station_name"`
-	NextStationIndex *int   `json:"next_station_index"`
-}
-
-type stationArrive struct {
-	Type         string `json:"type"`
-	TMS          int64  `json:"t_ms"`
-	StationID    string `json:"station_id"`
-	StationName  string `json:"station_name"`
-	StationIndex *int   `json:"station_index"`
-}
-
-type undo struct {
-	Type  string `json:"type"`
-	TMS   int64  `json:"t_ms"`
-	Count *int   `json:"count"`
-}
-
-type sessionEnd struct {
-	Type       string `json:"type"`
-	TMS        *int64 `json:"t_ms"` // When the rider tapped Stop.
-	EndedAt    string `json:"ended_at"`
-	Reason     string `json:"reason"`
-	Successful *bool  `json:"successful"`
-	Note       string `json:"note"`
-	// Where the rider got off. Empty when the rider chose "Not sure".
-	EndStationID   string `json:"end_station_id"`
-	EndStationName string `json:"end_station_name"`
-}
 
 type summary struct {
 	File                    string           `json:"file"`
@@ -117,6 +28,7 @@ type summary struct {
 	ProbeURLs               []string         `json:"probe_urls,omitempty"`
 	SampleIntervalInTransit *int             `json:"sample_interval_in_transit_ms,omitempty"`
 	SampleIntervalAtStation *int             `json:"sample_interval_at_station_ms,omitempty"`
+	DamagedLines            int              `json:"damaged_lines,omitempty"` // Not JSON; skipped.
 	Samples                 int              `json:"samples"`
 	ProbeOK                 int              `json:"probe_ok"`
 	PathSatisfied           int              `json:"path_satisfied"`
@@ -183,25 +95,16 @@ type stopSummary struct {
 	probeStats
 }
 
-type marker struct {
-	kind            string
-	tms             int64
-	stationID       string
-	stationName     string
-	nextStationID   string
-	nextStationName string
-}
-
 func main() {
 	var jsonOut bool
 	var energyOut bool
-	settings := defaultDetectionSettings
+	settings := recording.DefaultSettings
 	flag.BoolVar(&jsonOut, "json", false, "emit JSON")
 	flag.BoolVar(&energyOut, "energy", false, "print the per-second motion and service trace as CSV (for tuning stop detection)")
-	flag.IntVar(&settings.minimumStopSeconds, "min-stop-s", settings.minimumStopSeconds, "shortest quiet stretch that counts as a stop")
-	flag.IntVar(&settings.minimumSegmentSeconds, "min-segment-s", settings.minimumSegmentSeconds, "shortest ride between two stations, in seconds")
-	flag.IntVar(&settings.smoothingSeconds, "smooth-s", settings.smoothingSeconds, "rolling median width, in seconds")
-	flag.IntVar(&settings.minimumTunnelGapSeconds, "tunnel-gap-s", settings.minimumTunnelGapSeconds, "failed probes for at least this long count as one tunnel")
+	flag.IntVar(&settings.MinimumStopSeconds, "min-stop-s", settings.MinimumStopSeconds, "shortest quiet stretch that counts as a stop")
+	flag.IntVar(&settings.MinimumSegmentSeconds, "min-segment-s", settings.MinimumSegmentSeconds, "shortest ride between two stations, in seconds")
+	flag.IntVar(&settings.SmoothingSeconds, "smooth-s", settings.SmoothingSeconds, "rolling median width, in seconds")
+	flag.IntVar(&settings.MinimumTunnelGapSeconds, "tunnel-gap-s", settings.MinimumTunnelGapSeconds, "failed probes for at least this long count as one tunnel")
 	flag.Parse()
 
 	files := flag.Args()
@@ -242,179 +145,72 @@ func main() {
 	}
 }
 
-func summarizeFile(path string, settings detectionSettings) (summary, error) {
-	f, err := os.Open(path)
+func summarizeFile(path string, settings recording.Settings) (summary, error) {
+	ride, err := recording.Read(path)
 	if err != nil {
 		return summary{}, err
 	}
-	defer f.Close()
-
+	start, end := ride.Start, ride.End
 	out := summary{
-		File:             path,
-		InterfaceCounts:  map[string]int{},
-		HTTPStatusCounts: map[string]int{},
-		ProbeErrorCounts: map[string]int{},
+		File:                    path,
+		SessionID:               start.SessionID,
+		LineID:                  start.LineID,
+		LineName:                start.LineName,
+		FromStationID:           start.FromStationID,
+		FromStationName:         start.FromStationName,
+		ToStationID:             start.ToStationID,
+		ToStationName:           start.ToStationName,
+		StartedAt:               start.StartedAt,
+		EndedAt:                 end.EndedAt,
+		Successful:              end.Successful,
+		Note:                    end.Note,
+		Direction:               start.Direction,
+		DirectionLabel:          start.DirectionLabel,
+		ProbeURLs:               start.ProbeURLs,
+		SampleIntervalInTransit: start.SampleIntervalInTransitMS,
+		SampleIntervalAtStation: start.SampleIntervalAtStationMS,
+		DamagedLines:            ride.DamagedLines,
+		InterfaceCounts:         map[string]int{},
+		HTTPStatusCounts:        map[string]int{},
+		ProbeErrorCounts:        map[string]int{},
+	}
+	if len(out.ProbeURLs) == 0 && start.ProbeURL != "" {
+		out.ProbeURLs = []string{start.ProbeURL}
 	}
 
 	var rtts []int64
-	var samples []sample
-	var markers []marker
-	var motionBatches []motionBatch
-	var marks []mark
-	var routeStations []routeStation
-	var endEvent sessionEnd
-
-	sc := bufio.NewScanner(f)
-	// Allow long lines (though our events are small).
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
+	for _, s := range ride.Samples {
+		out.Samples++
+		if s.Probe.OK {
+			out.ProbeOK++
 		}
-		var kind struct {
-			Type string `json:"type"`
+		// Only successful probes have a real round trip; a failed one reports its timeout.
+		if s.Probe.OK && s.Probe.RTTMS != nil {
+			rtts = append(rtts, *s.Probe.RTTMS)
 		}
-		if err := json.Unmarshal([]byte(line), &kind); err != nil {
-			return summary{}, fmt.Errorf("invalid JSON: %w", err)
+		if s.Probe.HTTPStatus != nil {
+			out.HTTPStatusCounts[fmt.Sprintf("%d", *s.Probe.HTTPStatus)]++
+		}
+		if s.Probe.Error != nil && *s.Probe.Error != "" {
+			out.ProbeErrorCounts[*s.Probe.Error]++
 		}
 
-		switch kind.Type {
-		case "session_start":
-			var st sessionStart
-			if err := json.Unmarshal([]byte(line), &st); err != nil {
-				return summary{}, fmt.Errorf("decode session_start: %w", err)
-			}
-			out.SessionID = st.SessionID
-			out.LineID = st.LineID
-			out.FromStationID = st.FromStationID
-			out.ToStationID = st.ToStationID
-			out.StartedAt = st.StartedAt
-			out.Direction = st.Direction
-			out.LineName = st.LineName
-			out.FromStationName = st.FromStationName
-			out.ToStationName = st.ToStationName
-			out.DirectionLabel = st.DirectionLabel
-			if len(st.ProbeURLs) > 0 {
-				out.ProbeURLs = st.ProbeURLs
-			} else if st.ProbeURL != "" {
-				out.ProbeURLs = []string{st.ProbeURL}
-			}
-			out.SampleIntervalInTransit = st.SampleIntervalInTransitMS
-			out.SampleIntervalAtStation = st.SampleIntervalAtStationMS
-			routeStations = st.RouteStations
-
-		case "motion":
-			var batch motionBatch
-			if err := json.Unmarshal([]byte(line), &batch); err != nil {
-				return summary{}, fmt.Errorf("decode motion: %w", err)
-			}
-			motionBatches = append(motionBatches, batch)
-
-		case "mark":
-			var markEvent mark
-			if err := json.Unmarshal([]byte(line), &markEvent); err != nil {
-				return summary{}, fmt.Errorf("decode mark: %w", err)
-			}
-			marks = append(marks, markEvent)
-
-		case "station_depart":
-			var d stationDepart
-			if err := json.Unmarshal([]byte(line), &d); err != nil {
-				return summary{}, fmt.Errorf("decode station_depart: %w", err)
-			}
-			markers = append(markers, marker{
-				kind:            "depart",
-				tms:             d.TMS,
-				stationID:       d.StationID,
-				stationName:     d.StationName,
-				nextStationID:   d.NextStationID,
-				nextStationName: d.NextStationName,
-			})
-
-		case "station_arrive":
-			var a stationArrive
-			if err := json.Unmarshal([]byte(line), &a); err != nil {
-				return summary{}, fmt.Errorf("decode station_arrive: %w", err)
-			}
-			markers = append(markers, marker{
-				kind:        "arrive",
-				tms:         a.TMS,
-				stationID:   a.StationID,
-				stationName: a.StationName,
-			})
-
-		case "undo":
-			var u undo
-			if err := json.Unmarshal([]byte(line), &u); err != nil {
-				return summary{}, fmt.Errorf("decode undo: %w", err)
-			}
-			n := 1
-			if u.Count != nil && *u.Count > 0 {
-				n = *u.Count
-			}
-			for i := 0; i < n; i++ {
-				if len(markers) == 0 {
-					break
-				}
-				markers = markers[:len(markers)-1]
-			}
-
-		case "sample":
-			var s sample
-			if err := json.Unmarshal([]byte(line), &s); err != nil {
-				return summary{}, fmt.Errorf("decode sample: %w", err)
-			}
-			samples = append(samples, s)
-			out.Samples++
-			if s.Probe.OK {
-				out.ProbeOK++
-			}
-			// Only successful probes have a real round trip; a failed one reports its timeout.
-			if s.Probe.OK && s.Probe.RTTMS != nil {
-				rtts = append(rtts, *s.Probe.RTTMS)
-			}
-			if s.Probe.HTTPStatus != nil {
-				out.HTTPStatusCounts[fmt.Sprintf("%d", *s.Probe.HTTPStatus)]++
-			}
-			if s.Probe.Error != nil && *s.Probe.Error != "" {
-				out.ProbeErrorCounts[*s.Probe.Error]++
-			}
-
-			switch s.Path.Status {
-			case "satisfied":
-				out.PathSatisfied++
-			case "unsatisfied":
-				out.PathUnsatisfied++
-			case "requires_connection":
-				out.PathRequiresConn++
-			default:
-				out.PathUnknown++
-			}
-
-			if s.Path.Interface != nil && *s.Path.Interface != "" {
-				out.InterfaceCounts[*s.Path.Interface]++
-			} else {
-				out.InterfaceCounts["(nil)"]++
-			}
-
-		case "session_end":
-			var e sessionEnd
-			if err := json.Unmarshal([]byte(line), &e); err != nil {
-				return summary{}, fmt.Errorf("decode session_end: %w", err)
-			}
-			out.EndedAt = e.EndedAt
-			out.Successful = e.Successful
-			out.Note = e.Note
-			endEvent = e
-
+		switch s.Path.Status {
+		case "satisfied":
+			out.PathSatisfied++
+		case "unsatisfied":
+			out.PathUnsatisfied++
+		case "requires_connection":
+			out.PathRequiresConn++
 		default:
-			// ignore unknown events
+			out.PathUnknown++
 		}
-	}
-	if err := sc.Err(); err != nil {
-		return summary{}, err
+
+		if s.Path.Interface != nil && *s.Path.Interface != "" {
+			out.InterfaceCounts[*s.Path.Interface]++
+		} else {
+			out.InterfaceCounts["(nil)"]++
+		}
 	}
 
 	if len(rtts) > 0 {
@@ -430,20 +226,75 @@ func summarizeFile(path string, settings detectionSettings) (summary, error) {
 	}
 
 	switch {
-	case len(markers) > 0:
+	case len(ride.LegacyMarkers) > 0:
 		// Recorder builds before 2026-10: the rider marked every departure and arrival.
-		out.Segments = computeSegments(markers, samples)
-	case len(routeStations) > 0:
+		out.Segments = computeSegments(ride.LegacyMarkers, ride.Samples)
+	case len(start.RouteStations) > 0:
 		// Current recorder builds: find the segments in the motion trace.
-		out.Segments, out.Stops, out.StopDetection = detectSegments(motionBatches, marks, samples, routeStations, endEvent, settings)
+		out.Segments, out.Stops, out.StopDetection = detectSegments(ride, settings)
 	}
 	out.SegmentCount = len(out.Segments)
 
 	return out, nil
 }
 
+// detectSegments finds the stops, labels them from the route, and adds the probe statistics
+// for each segment and stop.
+func detectSegments(ride recording.Recording, settings recording.Settings) ([]segmentSummary, []stopSummary, *stopDetection) {
+	result := recording.DetectStops(ride, settings)
+	detection := &stopDetection{
+		Status:         result.Status,
+		TunnelGaps:     result.TunnelGaps,
+		Marks:          len(ride.Marks),
+		MarksNearStops: result.MarksNearStops,
+	}
+	if result.Runs == nil {
+		return nil, nil, detection
+	}
+	segmentCount := len(result.Runs)
+	detection.ExpectedSegments = &segmentCount
+	detection.DetectedSegments = segmentCount
+	segments, stops := labelRuns(ride.Start.RouteStations, result.Runs, ride.EndMS(), ride.Samples)
+	return segments, stops, detection
+}
+
+// labelRuns names each run and stop: run k goes from route[k] to route[k+1]. Each stop is the
+// time before a run; the last stop, until endMS, is where the rider got off.
+func labelRuns(route []recording.RouteStation, runs []recording.TimeSpan, endMS int64, samples []recording.Sample) ([]segmentSummary, []stopSummary) {
+	var segments []segmentSummary
+	var stops []stopSummary
+	previousEndMS := int64(0)
+	for position, run := range runs {
+		stops = append(stops, makeStop(route[position], previousEndMS, run.StartMS, samples))
+		segments = append(segments, segmentSummary{
+			FromStationID:   route[position].ID,
+			FromStationName: route[position].Name,
+			ToStationID:     route[position+1].ID,
+			ToStationName:   route[position+1].Name,
+			DepartTMS:       run.StartMS,
+			ArriveTMS:       run.EndMS,
+			DurationMS:      run.EndMS - run.StartMS,
+			probeStats:      probeStatsBetween(samples, run.StartMS, run.EndMS),
+		})
+		previousEndMS = run.EndMS
+	}
+	stops = append(stops, makeStop(route[len(runs)], previousEndMS, endMS, samples))
+	return segments, stops
+}
+
+func makeStop(station recording.RouteStation, startMS, endMS int64, samples []recording.Sample) stopSummary {
+	return stopSummary{
+		StationID:   station.ID,
+		StationName: station.Name,
+		StartTMS:    startMS,
+		EndTMS:      endMS,
+		DurationMS:  max(0, endMS-startMS),
+		probeStats:  probeStatsBetween(samples, startMS, endMS),
+	}
+}
+
 // probeStatsBetween summarizes the probes that started in [startMS, endMS).
-func probeStatsBetween(samples []sample, startMS, endMS int64) probeStats {
+func probeStatsBetween(samples []recording.Sample, startMS, endMS int64) probeStats {
 	var stats probeStats
 	var successfulRTTs []int64
 	for _, s := range samples {
@@ -515,6 +366,9 @@ func printSummary(s summary) {
 	if s.Successful != nil {
 		fmt.Printf("  successful: %v\n", *s.Successful)
 	}
+	if s.DamagedLines > 0 {
+		fmt.Printf("  damaged lines (skipped): %d\n", s.DamagedLines)
+	}
 	fmt.Printf("  samples: %d, probe ok: %d (%.1f%%)\n", s.Samples, s.ProbeOK, pct(s.ProbeOK, s.Samples))
 	fmt.Printf("  path satisfied: %d (%.1f%%)\n", s.PathSatisfied, pct(s.PathSatisfied, s.Samples))
 	if s.RTTMinMS != nil {
@@ -555,8 +409,8 @@ func printSummary(s summary) {
 
 // printEnergyTrace prints one CSV row per second of motion, for tuning the detection flags.
 // With good settings, rows that contain a Mark tap (mark=1) are "still".
-func printEnergyTrace(path string, settings detectionSettings) error {
-	batches, samples, marks, stopMS, err := readRideEvidence(path)
+func printEnergyTrace(path string, settings recording.Settings) error {
+	ride, err := recording.Read(path)
 	if err != nil {
 		return err
 	}
@@ -564,75 +418,23 @@ func printEnergyTrace(path string, settings detectionSettings) error {
 	// relative = smoothed jolt / ride median (stops are well below 1); service: 1 = a nearby probe
 	// succeeded, 0 = probes failed, blank = no probe.
 	fmt.Println("t_s,jolt_mg,smoothed_mg,relative,service,mark")
-	for _, second := range readSecondsOfRide(batches, samples, stopMS, settings) {
+	for _, second := range recording.SecondsOfRide(ride, settings) {
 		service := ""
-		if second.hasProbe {
+		if second.HasProbe {
 			service = "0"
-			if second.hasService {
+			if second.HasService {
 				service = "1"
 			}
 		}
 		hasMark := 0
-		for _, markEvent := range marks {
-			if markEvent.TMS >= second.startMS && markEvent.TMS < second.startMS+batchDurationMS {
+		for _, mark := range ride.Marks {
+			if mark.TMS >= second.StartMS && mark.TMS < second.StartMS+1000 {
 				hasMark = 1
 			}
 		}
-		fmt.Printf("%.1f,%.1f,%.1f,%.2f,%s,%d\n", float64(second.startMS)/1000, second.joltMilliG, second.smoothedMilliG, second.relativeJolt, service, hasMark)
+		fmt.Printf("%.1f,%.1f,%.1f,%.2f,%s,%d\n", float64(second.StartMS)/1000, second.JoltMilliG, second.SmoothedMilliG, second.RelativeJolt, service, hasMark)
 	}
 	return nil
-}
-
-// readRideEvidence reads only what the energy trace needs: motion batches, probe samples, marks,
-// and the Stop time. stopMS is math.MaxInt64 when the recording has no Stop time.
-func readRideEvidence(path string) (batches []motionBatch, samples []sample, marks []mark, stopMS int64, err error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, nil, nil, 0, err
-	}
-	defer file.Close()
-
-	stopMS = math.MaxInt64
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		var kind struct {
-			Type string `json:"type"`
-		}
-		if json.Unmarshal(line, &kind) != nil {
-			continue // Blank or damaged line; the summary reports these.
-		}
-		switch kind.Type {
-		case "motion":
-			var batch motionBatch
-			if err := json.Unmarshal(line, &batch); err != nil {
-				return nil, nil, nil, 0, fmt.Errorf("decode motion: %w", err)
-			}
-			batches = append(batches, batch)
-		case "sample":
-			var sampleEvent sample
-			if err := json.Unmarshal(line, &sampleEvent); err != nil {
-				return nil, nil, nil, 0, fmt.Errorf("decode sample: %w", err)
-			}
-			samples = append(samples, sampleEvent)
-		case "mark":
-			var markEvent mark
-			if err := json.Unmarshal(line, &markEvent); err != nil {
-				return nil, nil, nil, 0, fmt.Errorf("decode mark: %w", err)
-			}
-			marks = append(marks, markEvent)
-		case "session_end":
-			var endEvent sessionEnd
-			if err := json.Unmarshal(line, &endEvent); err != nil {
-				return nil, nil, nil, 0, fmt.Errorf("decode session_end: %w", err)
-			}
-			if endEvent.TMS != nil {
-				stopMS = *endEvent.TMS
-			}
-		}
-	}
-	return batches, samples, marks, stopMS, scanner.Err()
 }
 
 func pct(n, d int) float64 {
@@ -642,48 +444,33 @@ func pct(n, d int) float64 {
 	return (float64(n) / float64(d)) * 100.0
 }
 
-func computeSegments(markers []marker, samples []sample) []segmentSummary {
+// computeSegments pairs each departure marker with the next arrival marker.
+func computeSegments(markers []recording.LegacyMarker, samples []recording.Sample) []segmentSummary {
 	var out []segmentSummary
-
-	var depart *marker
-
-	for i := range markers {
-		m := &markers[i]
-		switch m.kind {
-		case "depart":
-			depart = m
-		case "arrive":
+	var depart *recording.LegacyMarker
+	for index := range markers {
+		marker := &markers[index]
+		switch marker.Kind {
+		case "station_depart":
+			depart = marker
+		case "station_arrive":
 			if depart == nil {
 				continue
 			}
-
-			from := *depart
-			to := *m
+			out = append(out, segmentSummary{
+				FromStationID:   depart.StationID,
+				FromStationName: depart.StationName,
+				ToStationID:     marker.StationID,
+				ToStationName:   marker.StationName,
+				DepartTMS:       depart.TMS,
+				ArriveTMS:       marker.TMS,
+				DurationMS:      max(0, marker.TMS-depart.TMS),
+				probeStats:      probeStatsBetween(samples, depart.TMS, marker.TMS),
+			})
 			depart = nil
-
-			seg := segmentSummary{
-				FromStationID:   from.stationID,
-				FromStationName: from.stationName,
-				ToStationID:     to.stationID,
-				ToStationName:   to.stationName,
-				DepartTMS:       from.tms,
-				ArriveTMS:       to.tms,
-				DurationMS:      max64(0, to.tms-from.tms),
-				probeStats:      probeStatsBetween(samples, from.tms, to.tms),
-			}
-
-			out = append(out, seg)
 		}
 	}
-
 	return out
-}
-
-func max64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func coalesce(a, b string) string {

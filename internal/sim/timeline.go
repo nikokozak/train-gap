@@ -59,10 +59,18 @@ type Phase struct {
 	IsForward  bool // True while the train travels toward the last station of the line.
 	Duration   time.Duration
 	HasService bool // False for a run through a tunnel without coverage.
+	// Recorded holds the condition measured in each second of the phase, for a replayed ride.
+	// Nil for the model.
+	Recorded []Condition
 }
 
 // ConditionAt returns the network condition at offset into the phase.
 func (phase Phase) ConditionAt(offset time.Duration) Condition {
+	if len(phase.Recorded) > 0 {
+		second := min(max(0, int(offset/time.Second)), len(phase.Recorded)-1)
+		return phase.Recorded[second]
+	}
+
 	connected := Condition{IsConnected: true, Latency: serviceLatency}
 	weak := Condition{IsConnected: true, Latency: weakSignalLatency}
 	if phase.Kind == AtStation || phase.HasService {
@@ -84,11 +92,12 @@ func (phase Phase) ConditionAt(offset time.Duration) Condition {
 	}
 }
 
-// Timeline is a ride as a list of phases: from the first station to the last and back,
-// repeated forever.
+// Timeline is a ride as a list of phases, repeated forever. For the model it goes from the first
+// station to the last and back; for a replay it is the recorded ride.
 type Timeline struct {
-	Phases []Phase
-	starts []time.Duration // starts[i] is when Phases[i] begins; the last entry is one full loop.
+	Phases     []Phase
+	starts     []time.Duration // starts[i] is when Phases[i] begins; the last entry is one full loop.
+	RecordedAt time.Time       // When the replayed ride was recorded. Zero for the model.
 }
 
 // NewTimeline builds the round trip for a line, using its scheduled running and dwell times.
@@ -127,7 +136,11 @@ func NewTimeline(line *lines.Line) Timeline {
 		addStop(stationIndex, false)
 		addRun(stationIndex-1, false)
 	}
+	return NewTimelineFromPhases(phases)
+}
 
+// NewTimelineFromPhases plays the phases in order and loops.
+func NewTimelineFromPhases(phases []Phase) Timeline {
 	starts := make([]time.Duration, len(phases)+1)
 	for index, phase := range phases {
 		starts[index+1] = starts[index] + phase.Duration

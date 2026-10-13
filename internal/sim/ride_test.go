@@ -7,7 +7,7 @@ import (
 
 // A ride with a clock the test moves by hand.
 func testRide() (*Ride, func(time.Duration)) {
-	ride := NewRide(testLine())
+	ride := NewRide(testLine(), NewTimeline(testLine()))
 	wallTime := time.Unix(0, 0)
 	ride.now = func() time.Time { return wallTime }
 	ride.anchorWall = wallTime
