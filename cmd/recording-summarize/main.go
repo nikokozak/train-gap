@@ -139,13 +139,15 @@ type summary struct {
 
 type stopDetection struct {
 	Status string `json:"status"`
-	// Nil when the rider chose "Not sure" for the end station.
+	// Nil when no segment count could be found.
 	ExpectedSegments *int `json:"expected_segments,omitempty"`
 	DetectedSegments int  `json:"detected_segments"`
-	HoldsRemoved     int  `json:"holds_removed,omitempty"`
-	// Calibration check: marks should fall inside detected stops, not inside segments.
-	Marks            int `json:"marks"`
-	MarksInsideStops int `json:"marks_inside_stops"`
+	// Stretches without service long enough to be a tunnel. On lines without tunnel coverage,
+	// one per segment.
+	TunnelGaps int `json:"tunnel_gaps"`
+	// Calibration check: marks should fall in detected stops (within 3 s), not inside segments.
+	Marks          int `json:"marks"`
+	MarksNearStops int `json:"marks_near_stops"`
 }
 
 // probeStats summarizes the probes that started inside a time window.
@@ -195,12 +197,11 @@ func main() {
 	var energyOut bool
 	settings := defaultDetectionSettings
 	flag.BoolVar(&jsonOut, "json", false, "emit JSON")
-	flag.BoolVar(&energyOut, "energy", false, "print the per-second motion trace as CSV (for tuning stop detection)")
-	flag.Float64Var(&settings.movingMilliG, "moving-mg", settings.movingMilliG, "smoothed RMS acceleration (milli-g) at or above which the train is moving")
-	flag.Float64Var(&settings.walkingMilliG, "walking-mg", settings.walkingMilliG, "smoothed RMS acceleration (milli-g) at or above which the rider is walking")
-	flag.Float64Var(&settings.minimumStopSeconds, "min-stop-s", settings.minimumStopSeconds, "shortest still period that counts as a stop")
-	flag.Float64Var(&settings.minimumSegmentSeconds, "min-segment-s", settings.minimumSegmentSeconds, "shortest moving period that counts as a ride between stations")
+	flag.BoolVar(&energyOut, "energy", false, "print the per-second motion and service trace as CSV (for tuning stop detection)")
+	flag.IntVar(&settings.minimumStopSeconds, "min-stop-s", settings.minimumStopSeconds, "shortest quiet stretch that counts as a stop")
+	flag.IntVar(&settings.minimumSegmentSeconds, "min-segment-s", settings.minimumSegmentSeconds, "shortest ride between two stations, in seconds")
 	flag.IntVar(&settings.smoothingSeconds, "smooth-s", settings.smoothingSeconds, "rolling median width, in seconds")
+	flag.IntVar(&settings.minimumTunnelGapSeconds, "tunnel-gap-s", settings.minimumTunnelGapSeconds, "failed probes for at least this long count as one tunnel")
 	flag.Parse()
 
 	files := flag.Args()
@@ -520,17 +521,9 @@ func printSummary(s summary) {
 		fmt.Printf("  rtt ms: min %d, p50 %d, p95 %d, max %d\n", *s.RTTMinMS, *s.RTTP50MS, *s.RTTP95MS, *s.RTTMaxMS)
 	}
 	if detection := s.StopDetection; detection != nil {
-		expected := "unknown (end station not given)"
-		if detection.ExpectedSegments != nil {
-			expected = fmt.Sprintf("%d", *detection.ExpectedSegments)
-		}
-		fmt.Printf("  stop detection: %s (segments detected %d, expected %s", detection.Status, detection.DetectedSegments, expected)
-		if detection.HoldsRemoved > 0 {
-			fmt.Printf(", holds removed %d", detection.HoldsRemoved)
-		}
-		fmt.Printf(")\n")
+		fmt.Printf("  stop detection: %s (segments %d, tunnel gaps without service %d)\n", detection.Status, detection.DetectedSegments, detection.TunnelGaps)
 		if detection.Marks > 0 {
-			fmt.Printf("  marks inside detected stops: %d of %d\n", detection.MarksInsideStops, detection.Marks)
+			fmt.Printf("  marks near detected stops: %d of %d\n", detection.MarksNearStops, detection.Marks)
 		}
 	}
 	if len(s.Segments) > 0 {
@@ -563,30 +556,39 @@ func printSummary(s summary) {
 // printEnergyTrace prints one CSV row per second of motion, for tuning the detection flags.
 // With good settings, rows that contain a Mark tap (mark=1) are "still".
 func printEnergyTrace(path string, settings detectionSettings) error {
-	batches, marks, stopMS, err := readMotionEvidence(path)
+	batches, samples, marks, stopMS, err := readRideEvidence(path)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("# %s\n", path)
-	fmt.Println("t_s,rms_mg,smoothed_mg,state,mark")
-	for _, second := range classifySeconds(batches, stopMS, settings) {
+	// relative = smoothed jolt / ride median (stops are well below 1); service: 1 = a nearby probe
+	// succeeded, 0 = probes failed, blank = no probe.
+	fmt.Println("t_s,jolt_mg,smoothed_mg,relative,service,mark")
+	for _, second := range readSecondsOfRide(batches, samples, stopMS, settings) {
+		service := ""
+		if second.hasProbe {
+			service = "0"
+			if second.hasService {
+				service = "1"
+			}
+		}
 		hasMark := 0
 		for _, markEvent := range marks {
 			if markEvent.TMS >= second.startMS && markEvent.TMS < second.startMS+batchDurationMS {
 				hasMark = 1
 			}
 		}
-		fmt.Printf("%.1f,%.1f,%.1f,%s,%d\n", float64(second.startMS)/1000, second.rmsMilliG, second.smoothedMilliG, second.state, hasMark)
+		fmt.Printf("%.1f,%.1f,%.1f,%.2f,%s,%d\n", float64(second.startMS)/1000, second.joltMilliG, second.smoothedMilliG, second.relativeJolt, service, hasMark)
 	}
 	return nil
 }
 
-// readMotionEvidence reads only what the energy trace needs: motion batches, marks, and the Stop time.
-// stopMS is math.MaxInt64 when the recording has no Stop time.
-func readMotionEvidence(path string) (batches []motionBatch, marks []mark, stopMS int64, err error) {
+// readRideEvidence reads only what the energy trace needs: motion batches, probe samples, marks,
+// and the Stop time. stopMS is math.MaxInt64 when the recording has no Stop time.
+func readRideEvidence(path string) (batches []motionBatch, samples []sample, marks []mark, stopMS int64, err error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, nil, 0, err
 	}
 	defer file.Close()
 
@@ -605,26 +607,32 @@ func readMotionEvidence(path string) (batches []motionBatch, marks []mark, stopM
 		case "motion":
 			var batch motionBatch
 			if err := json.Unmarshal(line, &batch); err != nil {
-				return nil, nil, 0, fmt.Errorf("decode motion: %w", err)
+				return nil, nil, nil, 0, fmt.Errorf("decode motion: %w", err)
 			}
 			batches = append(batches, batch)
+		case "sample":
+			var sampleEvent sample
+			if err := json.Unmarshal(line, &sampleEvent); err != nil {
+				return nil, nil, nil, 0, fmt.Errorf("decode sample: %w", err)
+			}
+			samples = append(samples, sampleEvent)
 		case "mark":
 			var markEvent mark
 			if err := json.Unmarshal(line, &markEvent); err != nil {
-				return nil, nil, 0, fmt.Errorf("decode mark: %w", err)
+				return nil, nil, nil, 0, fmt.Errorf("decode mark: %w", err)
 			}
 			marks = append(marks, markEvent)
 		case "session_end":
 			var endEvent sessionEnd
 			if err := json.Unmarshal(line, &endEvent); err != nil {
-				return nil, nil, 0, fmt.Errorf("decode session_end: %w", err)
+				return nil, nil, nil, 0, fmt.Errorf("decode session_end: %w", err)
 			}
 			if endEvent.TMS != nil {
 				stopMS = *endEvent.TMS
 			}
 		}
 	}
-	return batches, marks, stopMS, scanner.Err()
+	return batches, samples, marks, stopMS, scanner.Err()
 }
 
 func pct(n, d int) float64 {

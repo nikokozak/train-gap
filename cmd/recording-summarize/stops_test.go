@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,269 +9,215 @@ import (
 	"testing"
 )
 
-// Motion strengths for synthetic rides, in milli-g RMS.
+// Jolt levels for synthetic rides, in milli-g. Real rides: stops 10-40, running 60-150, walking 250+.
 const (
-	stillMilliG      = 5
-	trainMilliG      = 40
-	walkMilliG       = 300
-	noMotionData     = -1 // The app was paused: no batches for this phase.
-	readingsPerBatch = 20 // One-second batches at 20 Hz.
+	quietJolt   = 5
+	runningJolt = 100
+	walkingJolt = 400
 )
 
-// phase is one stretch of a synthetic ride: how long it lasts and how hard the phone shakes.
+const readingsPerBatch = 20 // One-second batches at 20 Hz.
+
+// phase is one stretch of a synthetic ride: its length, how hard the phone jolts, and whether
+// probes get through.
 type phase struct {
-	seconds   int
-	rmsMilliG int
+	seconds    int
+	joltMilliG int
+	hasService bool
 }
 
-// syntheticMotion builds one motion batch per second. Each batch alternates +rms and -rms
-// on the x axis, so its RMS is exactly rmsMilliG.
-func syntheticMotion(phases ...phase) []motionBatch {
+// syntheticRide builds one motion batch and one probe sample per second. Each batch alternates
+// between +jolt/2 and -jolt/2 on the x axis, so its jolt is exactly joltMilliG.
+func syntheticRide(phases ...phase) ([]motionBatch, []sample) {
 	var batches []motionBatch
+	var samples []sample
 	timeMS := int64(0)
 	for _, ridePhase := range phases {
 		for second := 0; second < ridePhase.seconds; second++ {
-			if ridePhase.rmsMilliG != noMotionData {
-				xMilliG := make([]int, readingsPerBatch)
-				for index := range xMilliG {
-					xMilliG[index] = ridePhase.rmsMilliG
-					if index%2 == 1 {
-						xMilliG[index] = -ridePhase.rmsMilliG
-					}
+			xMilliG := make([]int, readingsPerBatch)
+			for index := range xMilliG {
+				xMilliG[index] = ridePhase.joltMilliG / 2
+				if index%2 == 1 {
+					xMilliG[index] = -ridePhase.joltMilliG / 2
 				}
-				batches = append(batches, motionBatch{
-					TMS:     timeMS,
-					Hz:      readingsPerBatch,
-					XMilliG: xMilliG,
-					YMilliG: make([]int, readingsPerBatch),
-					ZMilliG: make([]int, readingsPerBatch),
-				})
 			}
+			batches = append(batches, motionBatch{
+				TMS:     timeMS,
+				Hz:      readingsPerBatch,
+				XMilliG: xMilliG,
+				YMilliG: make([]int, readingsPerBatch),
+				ZMilliG: make([]int, readingsPerBatch),
+			})
+			probe := sample{TMS: timeMS}
+			probe.Probe.OK = ridePhase.hasService
+			samples = append(samples, probe)
 			timeMS += batchDurationMS
 		}
 	}
-	return batches
+	return batches, samples
 }
 
-func TestRMSMilliG(t *testing.T) {
-	batch := motionBatch{XMilliG: []int{3, -3}, YMilliG: []int{4, -4}, ZMilliG: []int{0, 0}}
-	if got := batch.rmsMilliG(); got != 5 {
-		t.Fatalf("rmsMilliG() = %v; want 5", got)
+func TestJoltMilliG(t *testing.T) {
+	batch := motionBatch{XMilliG: []int{0, 10, 0, 10}, YMilliG: []int{0, 0, 0, 0}, ZMilliG: []int{0, 0, 0, 0}}
+	if got := batch.joltMilliG(); got != 10 {
+		t.Fatalf("joltMilliG() = %v; want 10", got)
 	}
 }
 
-func TestFindMovingRuns(t *testing.T) {
+func TestFindTunnelGaps(t *testing.T) {
 	tests := []struct {
 		name   string
 		phases []phase
-		want   []movingRun
+		want   []timeSpan
 	}{
 		{
-			name:   "two rides with a station stop between them",
-			phases: []phase{{30, stillMilliG}, {60, trainMilliG}, {25, stillMilliG}, {50, trainMilliG}, {20, stillMilliG}},
-			want:   []movingRun{{30_000, 90_000}, {115_000, 165_000}},
+			name:   "a tunnel between two stations",
+			phases: []phase{{10, 0, true}, {30, 0, false}, {10, 0, true}},
+			want:   []timeSpan{{10_000, 40_000}},
 		},
 		{
-			name:   "a short slowdown inside a ride is not a stop",
-			phases: []phase{{10, stillMilliG}, {40, trainMilliG}, {4, stillMilliG}, {40, trainMilliG}, {10, stillMilliG}},
-			want:   []movingRun{{10_000, 94_000}},
+			name:   "a one-second success inside a tunnel does not split it",
+			phases: []phase{{10, 0, true}, {15, 0, false}, {1, 0, true}, {14, 0, false}, {10, 0, true}},
+			want:   []timeSpan{{10_000, 40_000}},
 		},
 		{
-			name:   "walking onto the train is not a segment",
-			phases: []phase{{20, stillMilliG}, {10, walkMilliG}, {20, stillMilliG}, {60, trainMilliG}, {20, stillMilliG}},
-			want:   []movingRun{{50_000, 110_000}},
-		},
-		{
-			name:   "walking off after the last stop is not train motion",
-			phases: []phase{{10, stillMilliG}, {60, trainMilliG}, {5, stillMilliG}, {30, walkMilliG}},
-			want:   []movingRun{{10_000, 70_000}},
-		},
-		{
-			name:   "missing data splits a run, so it cannot hide a stop",
-			phases: []phase{{10, stillMilliG}, {30, trainMilliG}, {20, noMotionData}, {30, trainMilliG}, {10, stillMilliG}},
-			want:   []movingRun{{10_000, 40_000}, {60_000, 90_000}},
+			name:   "a few failed probes at a station are not a tunnel",
+			phases: []phase{{10, 0, true}, {5, 0, false}, {10, 0, true}},
+			want:   nil,
 		},
 	}
-
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			seconds := classifySeconds(syntheticMotion(test.phases...), math.MaxInt64, defaultDetectionSettings)
-			got := findMovingRuns(seconds, defaultDetectionSettings)
+			_, samples := syntheticRide(test.phases...)
+			got := findTunnelGaps(samples, 1<<62, defaultDetectionSettings)
 			if !reflect.DeepEqual(got, test.want) {
-				t.Fatalf("findMovingRuns() = %v; want %v", got, test.want)
+				t.Fatalf("findTunnelGaps() = %v; want %v", got, test.want)
 			}
 		})
 	}
 }
 
-func TestLabelRuns(t *testing.T) {
-	const routeLength = 4 // Stations A, B, C, D in ride order; A is the start.
-	first := movingRun{0, 60_000}
-	second := movingRun{80_000, 120_000}
-	third := movingRun{150_000, 200_000}
-	fourth := movingRun{220_000, 260_000}
+// Station A, a tunnel, station B, a tunnel, station C. Each tunnel has 10 s of service at each
+// end (the platforms), as on lines without tunnel coverage.
+func stationTunnelStation(stationB phase, tunnelMiddle ...phase) []phase {
+	phases := []phase{{20, quietJolt, true}, {10, runningJolt, true}}
+	phases = append(phases, tunnelMiddle...)
+	phases = append(phases, phase{10, runningJolt, true}, stationB, phase{10, runningJolt, true},
+		phase{40, runningJolt, false}, phase{10, runningJolt, true}, phase{20, quietJolt, true})
+	return phases
+}
+
+func TestDetectSegments(t *testing.T) {
+	route := []routeStation{{"A", "Alpha"}, {"B", "Bravo"}, {"C", "Charlie"}, {"D", "Delta"}}
+	stationB := phase{15, quietJolt, true}
+	tunnel := []phase{{40, runningJolt, false}}
+	tunnelWithCrawl := []phase{{10, runningJolt, false}, {20, quietJolt, false}, {10, runningJolt, false}}
+	wiredTunnel := []phase{{40, runningJolt, true}}
 
 	tests := []struct {
-		name             string
-		runs             []movingRun
-		gapHasNoService  []bool
-		endPosition      int
-		wantStatus       string
-		wantRuns         []movingRun
-		wantPositions    []int
-		wantHoldsRemoved int
+		name         string
+		phases       []phase
+		endStationID string
+		wantStatus   string
+		wantRuns     []movingRun // nil: check only that each run contains its tunnel gap
 	}{
 		{
-			name:            "segment count matches the end station",
-			runs:            []movingRun{first, second},
-			gapHasNoService: []bool{false},
-			endPosition:     2,
-			wantStatus:      statusMatched,
-			wantRuns:        []movingRun{first, second},
-			wantPositions:   []int{0, 1},
+			name:         "tunnel gaps confirm the count and motion places the stops",
+			phases:       stationTunnelStation(stationB, tunnel...),
+			endStationID: "C",
+			wantStatus:   statusMatched,
+			wantRuns:     []movingRun{{20_000, 80_000}, {95_000, 155_000}},
 		},
 		{
-			name:             "a stop without service is a hold in a tunnel",
-			runs:             []movingRun{first, second, third},
-			gapHasNoService:  []bool{false, true},
-			endPosition:      2,
-			wantStatus:       statusMatchedAfterHolds,
-			wantRuns:         []movingRun{first, {80_000, 200_000}},
-			wantPositions:    []int{0, 1},
-			wantHoldsRemoved: 1,
+			name:         "a quiet crawl in a tunnel is not a stop",
+			phases:       stationTunnelStation(stationB, tunnelWithCrawl...),
+			endStationID: "C",
+			wantStatus:   statusMatched,
+			wantRuns:     []movingRun{{20_000, 80_000}, {95_000, 155_000}},
 		},
 		{
-			name:            "an extra stop with service needs review",
-			runs:            []movingRun{first, second, third},
-			gapHasNoService: []bool{false, false},
-			endPosition:     2,
-			wantStatus:      statusCountMismatch,
-			wantRuns:        []movingRun{first, second, third},
-			wantPositions:   []int{unknownRoutePosition, unknownRoutePosition, unknownRoutePosition},
+			name:         "walking in the car at a station does not hide the stop",
+			phases:       stationTunnelStation(phase{15, walkingJolt, true}, tunnel...),
+			endStationID: "C",
+			wantStatus:   statusMatched,
 		},
 		{
-			name:          "a missed stop needs review",
-			runs:          []movingRun{first},
-			endPosition:   2,
-			wantStatus:    statusCountMismatch,
-			wantRuns:      []movingRun{first},
-			wantPositions: []int{unknownRoutePosition},
+			name:         "a wired tunnel: motion alone places the stops",
+			phases:       stationTunnelStation(stationB, wiredTunnel...),
+			endStationID: "C",
+			wantStatus:   statusMotionOnly,
+			wantRuns:     []movingRun{{20_000, 80_000}, {95_000, 155_000}},
 		},
 		{
-			name:            "no end station: labels count forward from the start",
-			runs:            []movingRun{first, second},
-			gapHasNoService: []bool{false},
-			endPosition:     unknownRoutePosition,
-			wantStatus:      statusUnverifiedEnd,
-			wantRuns:        []movingRun{first, second},
-			wantPositions:   []int{0, 1},
+			name:       "not sure: the tunnel gaps give the count",
+			phases:     stationTunnelStation(stationB, tunnel...),
+			wantStatus: statusUnverified,
+			wantRuns:   []movingRun{{20_000, 80_000}, {95_000, 155_000}},
 		},
 		{
-			name:            "no end station and more segments than the route has",
-			runs:            []movingRun{first, second, third, fourth},
-			gapHasNoService: []bool{false, false, false},
-			endPosition:     unknownRoutePosition,
-			wantStatus:      statusCountMismatch,
-			wantRuns:        []movingRun{first, second, third, fourth},
-			wantPositions:   []int{unknownRoutePosition, unknownRoutePosition, unknownRoutePosition, unknownRoutePosition},
+			name: "not sure and no tunnel gaps: no labels",
+			phases: []phase{{20, quietJolt, true}, {60, runningJolt, true}, stationB,
+				{60, runningJolt, true}, {20, quietJolt, true}},
+			wantStatus: statusCountUnknown,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			labelled, status, holdsRemoved := labelRuns(test.runs, test.gapHasNoService, routeLength, test.endPosition)
-			if status != test.wantStatus {
-				t.Fatalf("status = %q; want %q", status, test.wantStatus)
+			batches, samples := syntheticRide(test.phases...)
+			end := sessionEnd{EndStationID: test.endStationID}
+			segments, stops, detection := detectSegments(batches, nil, samples, route, end, defaultDetectionSettings)
+			if detection.Status != test.wantStatus {
+				t.Fatalf("status = %q; want %q", detection.Status, test.wantStatus)
 			}
-			if holdsRemoved != test.wantHoldsRemoved {
-				t.Fatalf("holdsRemoved = %d; want %d", holdsRemoved, test.wantHoldsRemoved)
+			if test.wantStatus == statusCountUnknown {
+				if segments != nil || stops != nil {
+					t.Fatalf("got labels for an unknown count: %v %v", segments, stops)
+				}
+				return
 			}
+
 			var gotRuns []movingRun
-			var gotPositions []int
-			for _, run := range labelled {
-				gotRuns = append(gotRuns, run.movingRun)
-				gotPositions = append(gotPositions, run.fromPosition)
+			for index, segment := range segments {
+				if segment.FromStationID != route[index].ID || segment.ToStationID != route[index+1].ID {
+					t.Fatalf("segment %d labelled %s->%s", index, segment.FromStationID, segment.ToStationID)
+				}
+				gotRuns = append(gotRuns, movingRun{segment.DepartTMS, segment.ArriveTMS})
 			}
-			if !reflect.DeepEqual(gotRuns, test.wantRuns) {
+			if test.wantRuns != nil && !reflect.DeepEqual(gotRuns, test.wantRuns) {
 				t.Fatalf("runs = %v; want %v", gotRuns, test.wantRuns)
 			}
-			if !reflect.DeepEqual(gotPositions, test.wantPositions) {
-				t.Fatalf("positions = %v; want %v", gotPositions, test.wantPositions)
+			tunnelGaps := findTunnelGaps(samples, 1<<62, defaultDetectionSettings)
+			if test.wantStatus == statusMatched {
+				for index, run := range gotRuns {
+					if run.startMS > tunnelGaps[index].startMS || run.endMS < tunnelGaps[index].endMS {
+						t.Fatalf("run %v does not contain tunnel gap %v", run, tunnelGaps[index])
+					}
+				}
+			}
+			if len(stops) != len(gotRuns)+1 || stops[len(stops)-1].StationID != route[len(gotRuns)].ID {
+				t.Fatalf("stops = %+v; want one per station from A to the end station", stops)
 			}
 		})
 	}
 }
 
-// A whole ride from A to C: service at stations, none between them, two Mark taps,
-// a walk out, and train-like motion after the Stop tap that must be ignored.
-func TestDetectSegmentsLabelsARide(t *testing.T) {
-	batches := syntheticMotion(
-		phase{30, stillMilliG}, // 0-30 s: waiting at A
-		phase{60, trainMilliG}, // 30-90 s: A to B
-		phase{25, stillMilliG}, // 90-115 s: stopped at B
-		phase{70, trainMilliG}, // 115-185 s: B to C
-		phase{10, stillMilliG}, // 185-195 s: stopped at C
-		phase{20, walkMilliG},  // 195-215 s: walking out; Stop tapped at 215 s
-		phase{40, trainMilliG}, // 215-255 s: after Stop, must be ignored
-	)
-	stationSpans := [][2]int64{{0, 30_000}, {90_000, 115_000}, {185_000, 255_000}}
-	var samples []sample
-	for timeMS := int64(0); timeMS < 255_000; timeMS += 1000 {
-		probe := sample{TMS: timeMS}
-		for _, span := range stationSpans {
-			if timeMS >= span[0] && timeMS < span[1] {
-				probe.Probe.OK = true
-			}
-		}
-		samples = append(samples, probe)
+func TestDetectSegmentsWithoutMotion(t *testing.T) {
+	_, _, detection := detectSegments(nil, nil, nil, []routeStation{{"A", "Alpha"}}, sessionEnd{}, defaultDetectionSettings)
+	if detection.Status != statusNoMotion {
+		t.Fatalf("status = %q; want %q", detection.Status, statusNoMotion)
 	}
-	route := []routeStation{{"A", "Alpha"}, {"B", "Bravo"}, {"C", "Charlie"}, {"D", "Delta"}}
-	stopTMS := int64(215_000)
-	end := sessionEnd{TMS: &stopTMS, EndStationID: "C"}
-	marks := []mark{{TMS: 100_000}, {TMS: 190_000}}
+}
 
-	segments, stops, detection := detectSegments(batches, marks, samples, route, end, defaultDetectionSettings)
-
-	if detection.Status != statusMatched {
-		t.Fatalf("status = %q; want %q", detection.Status, statusMatched)
+func TestCountMarksNearStops(t *testing.T) {
+	runs := []movingRun{{20_000, 80_000}, {95_000, 155_000}}
+	marks := []mark{
+		{TMS: 90_000},  // In the stop at B.
+		{TMS: 93_000},  // 2 s before departure: within tolerance.
+		{TMS: 120_000}, // Mid-run: the detection missed a stop here.
 	}
-	if detection.MarksInsideStops != 2 {
-		t.Fatalf("marks inside stops = %d; want 2", detection.MarksInsideStops)
-	}
-
-	type segmentLabel struct {
-		from, to          string
-		departMS, arrived int64
-		probeOK           int
-	}
-	var gotSegments []segmentLabel
-	for _, segment := range segments {
-		gotSegments = append(gotSegments, segmentLabel{segment.FromStationName, segment.ToStationName, segment.DepartTMS, segment.ArriveTMS, segment.ProbeOK})
-	}
-	wantSegments := []segmentLabel{
-		{"Alpha", "Bravo", 30_000, 90_000, 0},
-		{"Bravo", "Charlie", 115_000, 185_000, 0},
-	}
-	if !reflect.DeepEqual(gotSegments, wantSegments) {
-		t.Fatalf("segments = %+v; want %+v", gotSegments, wantSegments)
-	}
-
-	type stopLabel struct {
-		station          string
-		startMS, endMS   int64
-		samples, probeOK int
-	}
-	var gotStops []stopLabel
-	for _, stop := range stops {
-		gotStops = append(gotStops, stopLabel{stop.StationName, stop.StartTMS, stop.EndTMS, stop.Samples, stop.ProbeOK})
-	}
-	wantStops := []stopLabel{
-		{"Alpha", 0, 30_000, 30, 30},
-		{"Bravo", 90_000, 115_000, 25, 25},
-		{"Charlie", 185_000, 215_000, 30, 30},
-	}
-	if !reflect.DeepEqual(gotStops, wantStops) {
-		t.Fatalf("stops = %+v; want %+v", gotStops, wantStops)
+	if got := countMarksNearStops(marks, runs); got != 2 {
+		t.Fatalf("countMarksNearStops() = %d; want 2", got)
 	}
 }
 
@@ -293,16 +238,16 @@ func TestSummarizeFileReadsNewRecorderEvents(t *testing.T) {
 		"line_id": "X", "from_station_id": "A", "direction": "forward",
 		"route_stations": []map[string]string{{"id": "A", "name": "Alpha"}, {"id": "B", "name": "Bravo"}, {"id": "C", "name": "Charlie"}},
 	})
-	batches := syntheticMotion(phase{20, stillMilliG}, phase{60, trainMilliG}, phase{20, stillMilliG}, phase{60, trainMilliG}, phase{20, stillMilliG})
-	for _, batch := range batches {
+	batches, samples := syntheticRide(stationTunnelStation(phase{15, quietJolt, true}, phase{40, runningJolt, false})...)
+	for index, batch := range batches {
 		addEvent(struct {
 			Type string `json:"type"`
 			motionBatch
 		}{"motion", batch})
-		addEvent(map[string]any{"type": "sample", "t_ms": batch.TMS, "path": map[string]any{"status": "satisfied"}, "probe": map[string]any{"ok": true, "rtt_ms": 50}})
+		addEvent(map[string]any{"type": "sample", "t_ms": samples[index].TMS, "path": map[string]any{"status": "satisfied"}, "probe": map[string]any{"ok": samples[index].Probe.OK, "rtt_ms": 50}})
 	}
-	addEvent(map[string]any{"type": "mark", "t_ms": 90_000})
-	addEvent(map[string]any{"type": "session_end", "t_ms": 180_000, "ended_at": "2026-10-03T12:03:00Z", "end_station_id": "C", "end_station_name": "Charlie"})
+	addEvent(map[string]any{"type": "mark", "t_ms": 85_000})
+	addEvent(map[string]any{"type": "session_end", "t_ms": 175_000, "ended_at": "2026-10-03T12:03:00Z", "end_station_id": "C", "end_station_name": "Charlie"})
 
 	path := filepath.Join(t.TempDir(), "ride.ndjson")
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
@@ -314,11 +259,11 @@ func TestSummarizeFileReadsNewRecorderEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	detection := result.StopDetection
-	if detection == nil || detection.Status != statusMatched || detection.ExpectedSegments == nil || *detection.ExpectedSegments != 2 {
-		t.Fatalf("stop detection = %+v; want matched with 2 expected segments", detection)
+	if detection == nil || detection.Status != statusMatched || detection.TunnelGaps != 2 {
+		t.Fatalf("stop detection = %+v; want matched with 2 tunnel gaps", detection)
 	}
-	if detection.Marks != 1 || detection.MarksInsideStops != 1 {
-		t.Fatalf("marks = %d, inside stops = %d; want 1 and 1", detection.Marks, detection.MarksInsideStops)
+	if detection.Marks != 1 || detection.MarksNearStops != 1 {
+		t.Fatalf("marks = %d, near stops = %d; want 1 and 1", detection.Marks, detection.MarksNearStops)
 	}
 	if len(result.Segments) != 2 || result.Segments[1].FromStationName != "Bravo" || result.Segments[1].ToStationName != "Charlie" {
 		t.Fatalf("segments = %+v; want Alpha->Bravo, Bravo->Charlie", result.Segments)

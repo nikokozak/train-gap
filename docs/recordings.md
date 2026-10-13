@@ -61,33 +61,31 @@ go run ./cmd/recording-summarize --json -- path/to/session.ndjson
 
 ### How stops are found
 
-For current recordings, the summarizer finds the stops in the motion trace:
-1) Each one-second motion batch becomes one number: RMS acceleration (milli-g).
-2) A 5-second rolling median removes single jolts.
-3) Each second is **still**, **moving** (train), or **walking**. Motion after the Stop tap is ignored.
-4) Moving runs are joined across short pauses. Runs shorter than a ride between stations are dropped.
-5) The start and end stations give the expected number of segments.
+Your start and end stations give the number of segments. The summarizer then finds where the stops are, using two kinds of evidence:
+- **Motion.** A running train makes the phone jolt; a stopped train does not. The jolt is measured relative to the ride's own typical level, so it does not matter whether the phone is in your hand or your pocket.
+- **Service.** Stations have cell service. On lines without tunnel coverage, each tunnel shows as one long stretch of failed probes. A quiet stretch without service is a train crawling in a tunnel, not a stop.
+
+It chooses the stops that fit both best over the whole ride. Motion after the Stop tap is ignored.
 
 The result is in `stop_detection.status`:
-- `matched`: the count is correct. Segments and stops are labelled.
-- `matched_after_removing_holds`: correct after removing stops with no cell service. Underground stations have service, so such a stop is probably a train held in a tunnel.
-- `unverified_end`: you chose "Not sure". Labels count forward from the start station.
-- `count_mismatch`: no labels. Review the stops, or tune the thresholds.
+- `matched`: the number of tunnels without service equals the number of segments. Each segment contains one tunnel; motion places the stops. This is the reliable case.
+- `motion_only`: the tunnels did not match the count (a tunnel with service, elevated track, or an express train passing stations). Motion and service place the stops. Check the stop list.
+- `unverified_end`: you chose "Not sure". The tunnel count gives the number of segments.
+- `count_unknown`: "Not sure", and the tunnels do not give a count. No labels.
+- `no_fit`: no split fits the time limits. Check the end station.
 - `no_motion`: the recording has no motion data.
 
-### Tuning the thresholds (calibration ride)
+### Checking and tuning (calibration ride)
 
-The default thresholds are estimates. On a calibration ride, tap **Mark** at every stop, then:
+On a calibration ride, tap **Mark** when the doors open at each station. The summary then reports how many marks fall in detected stops ("marks near detected stops"). A mark is near a stop when it is within 3 s of it. If you walk off the train as the doors open, that last mark will not count.
+
+To see the evidence second by second:
 
 ```bash
 go run ./cmd/recording-summarize -energy -- path/to/session.ndjson > energy.csv
 ```
 
-Each row is one second: RMS, smoothed RMS, state, and `mark=1` where you tapped Mark. Rows with a mark must be `still`. Set the flags from what you see, and check that the summary reports every mark inside a detected stop:
-
-```bash
-go run ./cmd/recording-summarize -moving-mg 30 -walking-mg 250 -min-stop-s 8 -min-segment-s 20 -- path/to/session.ndjson
-```
+Each row is one second: the jolt, the smoothed jolt, the jolt relative to the ride's typical level (stops are well below 1), service (`1` a probe got through, `0` probes failed), and `mark=1` where you tapped Mark. The flags `-min-stop-s`, `-min-segment-s`, `-smooth-s`, and `-tunnel-gap-s` change the limits.
 
 ## Next processing step (how Train-Gap can use it)
 
