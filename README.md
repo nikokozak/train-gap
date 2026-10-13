@@ -71,3 +71,7 @@ Without service, nothing fails and nothing is dropped. Reads, writes, and new co
 - Only TCP. UDP, for example HTTP/3, does not go through the proxy.
 - Only clients that use a proxy. Go's HTTP client never proxies `localhost`, and most clients skip hosts in `NO_PROXY`.
 - The delay applies to each chunk of data that the proxy reads or writes, not to each packet.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
