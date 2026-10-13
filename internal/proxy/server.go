@@ -1,8 +1,12 @@
+// Package proxy is a SOCKS5 proxy that applies the simulated network condition to every connection.
 package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -12,54 +16,35 @@ import (
 	"github.com/nikokozak/train-gap/internal/sim"
 )
 
-// Stats holds proxy statistics
+// While there is no service, connections check this often whether it has returned. The condition
+// changes with simulated time, so there is no event to wait on; a blackout lasts tens of seconds.
+const blackoutPollInterval = 100 * time.Millisecond
+
+// Stats counts traffic through the proxy.
 type Stats struct {
-	Connections  int64
-	BytesSent    int64
-	BytesRecv    int64
-	DroppedConns int64
+	Connections int64
+	BytesSent   int64
+	BytesRecv   int64
 }
 
-// Server is a SOCKS5 proxy server with traffic shaping
+// Server is a SOCKS5 proxy on 127.0.0.1 that shapes traffic with the current condition.
 type Server struct {
-	port     int
-	shaper   *Shaper
-	listener net.Listener
-	server   *socks5.Server
-	stats    Stats
-	running  bool
-	mu       sync.Mutex
+	port             int
+	currentCondition func() sim.Condition
+	listener         net.Listener
+	server           *socks5.Server
+	stats            Stats
+	running          bool
+	mu               sync.Mutex
 }
 
-type timeoutError string
-
-func (e timeoutError) Error() string   { return string(e) }
-func (e timeoutError) Timeout() bool   { return true }
-func (e timeoutError) Temporary() bool { return true }
-
-func sleepWithContext(ctx context.Context, d time.Duration) error {
-	if d <= 0 {
-		return nil
-	}
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
+// NewServer creates a proxy on port (0 picks a free port). currentCondition is called for
+// every chunk of data, so it must be fast and safe for concurrent use.
+func NewServer(port int, currentCondition func() sim.Condition) *Server {
+	return &Server{port: port, currentCondition: currentCondition}
 }
 
-// NewServer creates a new proxy server
-func NewServer(port int) *Server {
-	return &Server{
-		port:   port,
-		shaper: NewShaper(),
-	}
-}
-
-// Start starts the proxy server
+// Start begins accepting connections in the background.
 func (s *Server) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -68,9 +53,10 @@ func (s *Server) Start() error {
 		return fmt.Errorf("server already running")
 	}
 
-	// Create SOCKS5 config with our custom dial function
 	conf := &socks5.Config{
 		Dial: s.shapedDial,
+		// Failed connections are normal here; the library would print them over the TUI.
+		Logger: log.New(io.Discard, "", 0),
 	}
 
 	server, err := socks5.New(conf)
@@ -79,7 +65,6 @@ func (s *Server) Start() error {
 	}
 	s.server = server
 
-	// Start listening
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", s.port))
 	if err != nil {
 		return fmt.Errorf("failed to listen on port %d: %w", s.port, err)
@@ -92,9 +77,7 @@ func (s *Server) Start() error {
 	}
 	s.running = true
 
-	// Accept connections in background
 	go s.acceptLoop()
-
 	return nil
 }
 
@@ -135,50 +118,38 @@ func (s *Server) acceptLoop() {
 		backoff = 0
 		atomic.AddInt64(&s.stats.Connections, 1)
 
-		// Handle connection in background
 		go func(c net.Conn) {
-			if err := s.server.ServeConn(c); err != nil {
-				// Connection error (likely shaped/dropped)
-				atomic.AddInt64(&s.stats.DroppedConns, 1)
-			}
+			// The error only says how the client's connection ended; a stall that the client
+			// gave up on is expected behavior, not a proxy failure.
+			_ = s.server.ServeConn(c)
 		}(conn)
 	}
 }
 
-// shapedDial is a custom dial function that wraps connections with shaping
+// shapedDial opens the connection to the destination the way a phone would: it waits for
+// service, pays the latency once, and returns a connection that keeps applying the condition.
 func (s *Server) shapedDial(ctx context.Context, network, addr string) (net.Conn, error) {
-	// Check if completely blocked
-	if s.shaper.IsBlocked() {
-		// Simulate connection timeout
-		_ = sleepWithContext(ctx, 500*time.Millisecond)
-		return nil, timeoutError("connection timeout (tunnel)")
+	if err := waitForService(ctx.Done(), s.currentCondition); err != nil {
+		return nil, err
+	}
+	if err := sleepWithCancel(ctx.Done(), s.currentCondition().Latency); err != nil {
+		return nil, err
 	}
 
-	// Add connection delay
-	if delay := s.shaper.Delay(); delay > 0 {
-		if err := sleepWithContext(ctx, delay); err != nil {
-			return nil, err
-		}
-	}
-
-	// Dial the actual connection
-	dialer := &net.Dialer{
-		Timeout: 30 * time.Second,
-	}
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
 	conn, err := dialer.DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}
-
-	// Wrap with shaping
-	return &shapedConnWrapper{
-		Conn:   conn,
-		shaper: s.shaper,
-		stats:  &s.stats,
+	return &shapedConn{
+		Conn:             conn,
+		currentCondition: s.currentCondition,
+		stats:            &s.stats,
+		closed:           make(chan struct{}),
 	}, nil
 }
 
-// Stop stops the proxy server
+// Stop stops accepting connections.
 func (s *Server) Stop() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -194,18 +165,12 @@ func (s *Server) Stop() error {
 	return nil
 }
 
-// SetCondition updates the network condition
-func (s *Server) SetCondition(c sim.NetworkCondition) {
-	s.shaper.SetCondition(c)
-}
-
 // GetStats returns proxy statistics
 func (s *Server) GetStats() Stats {
 	return Stats{
-		Connections:  atomic.LoadInt64(&s.stats.Connections),
-		BytesSent:    atomic.LoadInt64(&s.stats.BytesSent),
-		BytesRecv:    atomic.LoadInt64(&s.stats.BytesRecv),
-		DroppedConns: atomic.LoadInt64(&s.stats.DroppedConns),
+		Connections: atomic.LoadInt64(&s.stats.Connections),
+		BytesSent:   atomic.LoadInt64(&s.stats.BytesSent),
+		BytesRecv:   atomic.LoadInt64(&s.stats.BytesRecv),
 	}
 }
 
@@ -214,62 +179,76 @@ func (s *Server) Port() int {
 	return s.port
 }
 
-// shapedConnWrapper wraps a connection with shaping and stats tracking
-type shapedConnWrapper struct {
+// shapedConn is the proxy's connection to the destination. Like TCP through a tunnel, data stalls
+// while there is no service and continues when it returns; nothing is dropped. Each chunk of data
+// waits the condition's latency once in each direction.
+type shapedConn struct {
 	net.Conn
-	shaper *Shaper
-	stats  *Stats
+	currentCondition func() sim.Condition
+	stats            *Stats
+	closed           chan struct{} // Closed by Close, so a stalled read or write gives up.
+	closeOnce        sync.Once
 }
 
-func (c *shapedConnWrapper) Read(b []byte) (int, error) {
-	// Check if blocked
-	if c.shaper.IsBlocked() {
-		time.Sleep(100 * time.Millisecond)
-		return 0, &net.OpError{Op: "read", Err: timeoutError("read timeout (tunnel)")}
-	}
-
-	// Apply delay
-	if delay := c.shaper.Delay(); delay > 0 {
-		time.Sleep(delay)
-	}
-
-	// Check for packet loss on read
-	if c.shaper.ShouldDrop() {
-		// Return timeout-like behavior
-		time.Sleep(50 * time.Millisecond)
-		// Don't actually drop reads completely, just delay them significantly
-		// This simulates packet loss at the TCP level better
-	}
-
+// Read returns data from the destination, held back while there is no service.
+func (c *shapedConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
 	if n > 0 {
+		if waitErr := c.delay(); waitErr != nil {
+			return 0, waitErr
+		}
 		atomic.AddInt64(&c.stats.BytesRecv, int64(n))
 	}
 	return n, err
 }
 
-func (c *shapedConnWrapper) Write(b []byte) (int, error) {
-	// Check if blocked
-	if c.shaper.IsBlocked() {
-		time.Sleep(100 * time.Millisecond)
-		return 0, &net.OpError{Op: "write", Err: timeoutError("write timeout (tunnel)")}
+// Write sends data to the destination once there is service.
+func (c *shapedConn) Write(b []byte) (int, error) {
+	if err := c.delay(); err != nil {
+		return 0, err
 	}
-
-	// Apply delay
-	if delay := c.shaper.Delay(); delay > 0 {
-		time.Sleep(delay)
-	}
-
-	// Check for packet loss on write
-	if c.shaper.ShouldDrop() {
-		// Pretend we wrote it but drop
-		atomic.AddInt64(&c.stats.BytesSent, int64(len(b)))
-		return len(b), nil
-	}
-
 	n, err := c.Conn.Write(b)
-	if n > 0 {
-		atomic.AddInt64(&c.stats.BytesSent, int64(n))
-	}
+	atomic.AddInt64(&c.stats.BytesSent, int64(n))
 	return n, err
+}
+
+// Close also releases any read or write that is waiting for service.
+func (c *shapedConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+// delay waits for service, then for the latency.
+func (c *shapedConn) delay() error {
+	if err := waitForService(c.closed, c.currentCondition); err != nil {
+		return err
+	}
+	return sleepWithCancel(c.closed, c.currentCondition().Latency)
+}
+
+// errConnectionClosed ends a wait when the connection closes.
+var errConnectionClosed = errors.New("connection closed while waiting for service")
+
+// waitForService returns when the condition is connected, or an error when cancel closes first.
+func waitForService(cancel <-chan struct{}, currentCondition func() sim.Condition) error {
+	for !currentCondition().IsConnected {
+		if err := sleepWithCancel(cancel, blackoutPollInterval); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sleepWithCancel(cancel <-chan struct{}, duration time.Duration) error {
+	if duration <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-cancel:
+		return errConnectionClosed
+	case <-timer.C:
+		return nil
+	}
 }

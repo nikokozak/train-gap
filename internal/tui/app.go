@@ -14,32 +14,30 @@ import (
 const (
 	maxWidth     = 64
 	tickInterval = 50 * time.Millisecond
+	speedStep    = 1.5 // Each arrow key press changes the speed by this factor.
 )
 
 type TickMsg time.Time
 
+// Model draws a ride. The ride runs on its own clock; the model only reads it and passes keys on.
 type Model struct {
-	train     *sim.Train
+	ride      *sim.Ride
 	line      *lines.Line
-	condition sim.NetworkCondition
 	proxyPort int
 	startTime time.Time
-	lastTick  time.Time
 	width     int
 	height    int
 	quitting  bool
 	frame     int
 }
 
-func NewModel(line *lines.Line, proxyPort int) Model {
-	now := time.Now()
+// NewModel shows the ride and the proxy port that applies it.
+func NewModel(ride *sim.Ride, proxyPort int) Model {
 	return Model{
-		train:     sim.NewTrain(line),
-		line:      line,
-		condition: sim.FullConnectivity(),
+		ride:      ride,
+		line:      ride.Line,
 		proxyPort: proxyPort,
-		startTime: now,
-		lastTick:  now,
+		startTime: time.Now(),
 		width:     80,
 		height:    24,
 	}
@@ -63,17 +61,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		case " ":
-			m.train.TogglePause()
+			m.ride.SetPaused(!m.ride.IsPaused())
 		case "right", "l":
-			m.train.IncreaseSpeed()
+			m.ride.SetSpeed(m.ride.Speed() * speedStep)
 		case "left", "h":
-			m.train.DecreaseSpeed()
-		case "m":
-			m.train.ToggleManualMode()
+			m.ride.SetSpeed(m.ride.Speed() / speedStep)
 		case "n", "enter":
-			m.train.ManualAdvance()
+			m.ride.SkipToNextPhase()
 		case "r":
-			m.train.SetSpeed(1.0)
+			m.ride.SetSpeed(1.0)
 		}
 
 	case tea.WindowSizeMsg:
@@ -81,17 +77,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 
 	case TickMsg:
-		now := time.Time(msg)
-		dt := now.Sub(m.lastTick)
-		if dt <= 0 {
-			dt = tickInterval
-		}
-		// Avoid huge jumps after pauses/suspends.
-		if dt > 2*time.Second {
-			dt = 2 * time.Second
-		}
-		m.lastTick = now
-		m.condition = m.train.Update(dt)
+		// The ride keeps its own time; a tick only redraws.
 		m.frame++
 		return m, tick()
 	}
@@ -104,7 +90,7 @@ func (m Model) View() string {
 		return ""
 	}
 
-	if m.line == nil || m.train == nil {
+	if m.line == nil || m.ride == nil {
 		return "Train-Gap: internal error (missing model)"
 	}
 
@@ -154,15 +140,10 @@ func (m Model) View() string {
 
 func (m Model) viewHeader(w int, lineColor lipgloss.Color) string {
 	// Destination based on direction
-	var destination string
-	if len(m.line.Stations) == 0 {
-		destination = "---"
-	} else if m.train.Direction > 0 {
-		// Going towards end of line (Brooklyn/Canarsie for L)
+	phase, _, _ := m.ride.Position()
+	destination := m.line.Stations[0].ShortName
+	if phase.IsForward {
 		destination = m.line.Stations[len(m.line.Stations)-1].ShortName
-	} else {
-		// Going towards start of line (Manhattan/8th Ave for L)
-		destination = m.line.Stations[0].ShortName
 	}
 
 	badge := lipgloss.NewStyle().
@@ -181,14 +162,16 @@ func (m Model) viewHeader(w int, lineColor lipgloss.Color) string {
 		Foreground(lipgloss.Color("#fff")).
 		Render("TRAIN-GAP")
 
-	station := "---"
-	if s := m.train.CurrentStation(); s != nil {
-		station = s.ShortName
+	from := m.line.Stations[phase.FromIndex].ShortName
+	to := m.line.Stations[phase.ToIndex].ShortName
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#666"))
+	bright := lipgloss.NewStyle().Foreground(lipgloss.Color("#fff")).Bold(true)
+	right := dim.Render("@ ") + bright.Render(from)
+	if phase.Kind == sim.Running {
+		right = bright.Render(from) + dim.Render(" → ") + bright.Render(to)
 	}
 
 	left := badge + " " + dest + "  " + title
-	right := lipgloss.NewStyle().Foreground(lipgloss.Color("#666")).Render("@ ") +
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#fff")).Bold(true).Render(station)
 
 	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
@@ -199,11 +182,8 @@ func (m Model) viewHeader(w int, lineColor lipgloss.Color) string {
 }
 
 func (m Model) viewTrack(w int, lineColor lipgloss.Color) string {
-	idx, prog := m.train.DisplayPosition()
-
-	if len(m.line.Stations) == 0 {
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("#666")).Render("No stations configured.")
-	}
+	phase, _, offset := m.ride.Position()
+	idx := phase.FromIndex
 
 	// Show 5 stations
 	n := 5
@@ -264,20 +244,10 @@ func (m Model) viewTrack(w int, lineColor lipgloss.Color) string {
 	}
 
 	// Calculate train position
-	trainStationIdx := idx - start
-	var trainFloatPos float64
-	if prog < 0.1 {
-		trainFloatPos = float64(trainStationIdx)
-	} else {
-		normalizedProg := (prog - 0.1) / 0.8
-		if normalizedProg > 1.0 {
-			normalizedProg = 1.0
-		}
-		if m.train.Direction > 0 {
-			trainFloatPos = float64(trainStationIdx) + normalizedProg
-		} else {
-			trainFloatPos = float64(trainStationIdx) - normalizedProg
-		}
+	trainFloatPos := float64(idx - start)
+	if phase.Kind == sim.Running && phase.Duration > 0 {
+		runProgress := float64(offset) / float64(phase.Duration)
+		trainFloatPos += float64(phase.ToIndex-phase.FromIndex) * runProgress
 	}
 
 	// Convert to character position
@@ -338,12 +308,8 @@ func (m Model) viewTrack(w int, lineColor lipgloss.Color) string {
 		}
 
 		if inTrackSegment {
-			// Check if this segment is a tunnel
-			isTunnel := false
-			if seg := m.line.GetSegment(stations[segmentIdx].ID, stations[segmentIdx+1].ID); seg != nil && seg.IsTunnel {
-				isTunnel = true
-			}
-			if isTunnel {
+			// A dotted track is a tunnel without service.
+			if !m.line.Segments[start+segmentIdx].HasService {
 				trackLine.WriteString(dim.Render("┄"))
 			} else {
 				trackLine.WriteString(lineStyle.Render("─"))
@@ -394,175 +360,108 @@ func (m Model) viewTrack(w int, lineColor lipgloss.Color) string {
 	return trackLine.String() + "\n" + nameRow.String()
 }
 
+// viewState shows what the train is doing and how long until the next stop or run starts.
 func (m Model) viewState(w int, lineColor lipgloss.Color) string {
-	prog := m.train.Progress
-	if prog < 0 {
-		prog = 0
-	} else if prog > 1 {
-		prog = 1
-	}
+	phase, _, offset := m.ride.Position()
+	condition := phase.ConditionAt(offset)
 
 	var color lipgloss.Color
 	var label string
-
-	switch m.train.State {
-	case sim.AtStation:
-		color = ColorConnected
-		label = "Boarding"
-	case sim.Departing:
-		color = ColorDegrading
-		label = "Departing"
-	case sim.InTransit:
-		if m.train.IsInTunnel() {
-			color = ColorDisconnected
-			label = "In Tunnel"
-		} else {
-			color = ColorDisconnected // Show as bad since loss is high
-			label = "In Transit"
-		}
-	case sim.Arriving:
-		color = ColorRecovering
-		label = "Arriving"
+	switch {
+	case phase.Kind == sim.AtStation:
+		color, label = ColorConnected, "At station"
+	case !condition.IsConnected:
+		color, label = ColorDisconnected, "No service"
+	default:
+		color, label = ColorDegrading, "Running"
 	}
-
 	style := lipgloss.NewStyle().Foreground(color).Bold(true)
 	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#555"))
 
-	// Progress bar
-	barW := w - 24
-	if barW < 10 {
-		barW = 10
+	progress := 0.0
+	if phase.Duration > 0 {
+		progress = min(1, float64(offset)/float64(phase.Duration))
 	}
+	barW := max(10, w-24)
+	filled := int(progress * float64(barW))
 
-	filled := int(prog * float64(barW))
-	empty := barW - filled
-
-	// Pulse in tunnel or heavy loss
+	// The bar pulses while there is no service, unless the ride is paused.
 	char := "█"
-	if m.train.State == sim.InTransit {
-		if (m.frame/6)%2 == 0 {
-			char = "▓"
-		} else {
+	if !condition.IsConnected && !m.ride.IsPaused() {
+		char = "▓"
+		if (m.frame/6)%2 == 1 {
 			char = "░"
 		}
 	}
-
 	bar := lipgloss.NewStyle().Foreground(color).Render(strings.Repeat(char, filled)) +
-		dim.Render(strings.Repeat("░", empty))
+		dim.Render(strings.Repeat("░", barW-filled))
 
-	pct := int(prog * 100)
-	if pct < 0 {
-		pct = 0
-	} else if pct > 100 {
-		pct = 100
-	}
-	remaining := (100 - pct) / 10
-	if remaining < 0 {
-		remaining = 0
+	// Time left in this phase, in real seconds at the current speed.
+	remaining := "held"
+	if !m.ride.IsPaused() {
+		remainingTime := time.Duration(float64(phase.Duration-offset) / m.ride.Speed())
+		remaining = fmt.Sprintf("%ds left", int(remainingTime.Round(time.Second).Seconds()))
 	}
 
-	return fmt.Sprintf("%-10s %s %3d%% %s",
-		style.Render(label),
-		bar,
-		pct,
-		dim.Render(fmt.Sprintf("~%ds", remaining)))
+	return fmt.Sprintf("%-10s %s %s", style.Render(label), bar, dim.Render(remaining))
 }
 
+// viewMetrics shows the condition the proxy applies right now.
 func (m Model) viewMetrics(w int) string {
+	condition := m.ride.Condition()
 	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#666"))
-	val := lipgloss.NewStyle().Foreground(lipgloss.Color("#fff")).Bold(true)
+	value := lipgloss.NewStyle().Foreground(lipgloss.Color("#fff")).Bold(true)
 
-	// Connection status
 	var icon, statusText string
 	var statusColor lipgloss.Color
-
 	switch {
-	case !m.condition.Connected:
-		icon, statusText, statusColor = "◯", "DISCONNECTED", ColorDisconnected
-	case m.condition.PacketLoss > 0.5:
-		icon, statusText, statusColor = "◔", "POOR SIGNAL", ColorDisconnected
-	case m.condition.PacketLoss > 0.3:
-		icon, statusText, statusColor = "◐", "DEGRADED", ColorDegrading
-	case m.condition.PacketLoss > 0.1:
-		icon, statusText, statusColor = "◑", "RECOVERING", ColorRecovering
+	case !condition.IsConnected:
+		icon, statusText, statusColor = "◯", "NO SERVICE", ColorDisconnected
+	case condition.IsWeak():
+		icon, statusText, statusColor = "◐", "WEAK SIGNAL", ColorRecovering
 	default:
 		icon, statusText, statusColor = "●", "CONNECTED", ColorConnected
 	}
-
-	statusStyle := lipgloss.NewStyle().Foreground(statusColor).Bold(true)
-	statusLine := statusStyle.Render(icon + " " + statusText)
-
-	// Latency bar
-	latencyMs := m.condition.Latency.Milliseconds()
-	if latencyMs < 0 {
-		latencyMs = 0
-	}
-	latencyPct := float64(latencyMs) / 500.0 // 500ms = 100%
-	if latencyPct > 1.0 {
-		latencyPct = 1.0
-	}
-	barW := w - 28 // Space for label and value
-	if barW < 10 {
-		barW = 10
-	}
-	latencyFilled := int(latencyPct * float64(barW))
-	latencyEmpty := barW - latencyFilled
-
-	latencyBar := lipgloss.NewStyle().Foreground(statusColor).Render(strings.Repeat("█", latencyFilled)) +
-		dim.Render(strings.Repeat("░", latencyEmpty))
-	latencyLine := dim.Render("Latency      ") + val.Render(fmt.Sprintf("%4dms", latencyMs)) + "  " + latencyBar
-
-	// Packet Loss bar
-	lossPct := m.condition.PacketLoss
-	if lossPct < 0 {
-		lossPct = 0
-	} else if lossPct > 1 {
-		lossPct = 1
-	}
-	lossFilled := int(lossPct * float64(barW))
-	lossEmpty := barW - lossFilled
-
-	var lossColor lipgloss.Color
-	if lossPct > 0.5 {
-		lossColor = ColorDisconnected
-	} else if lossPct > 0.2 {
-		lossColor = ColorDegrading
-	} else {
-		lossColor = ColorConnected
+	statusLine := lipgloss.NewStyle().Foreground(statusColor).Bold(true).Render(icon + " " + statusText)
+	if !condition.IsConnected {
+		statusLine += dim.Render("  connections wait for service")
 	}
 
-	lossBar := lipgloss.NewStyle().Foreground(lossColor).Render(strings.Repeat("█", lossFilled)) +
-		dim.Render(strings.Repeat("░", lossEmpty))
-	lossLine := dim.Render("Packet Loss  ") + val.Render(fmt.Sprintf("%5.0f%%", lossPct*100)) + "  " + lossBar
+	// Added delay, on a scale where 500 ms fills the bar.
+	barW := max(10, w-28)
+	delayText := "    —"
+	filled := 0
+	if condition.IsConnected {
+		delayText = fmt.Sprintf("%4dms", condition.Latency.Milliseconds())
+		filled = min(barW, int(float64(barW)*float64(condition.Latency)/float64(500*time.Millisecond)))
+	}
+	delayBar := lipgloss.NewStyle().Foreground(statusColor).Render(strings.Repeat("█", filled)) +
+		dim.Render(strings.Repeat("░", barW-filled))
+	delayLine := dim.Render("Added delay  ") + value.Render(delayText) + "  " + delayBar
 
-	return statusLine + "\n\n" + latencyLine + "\n" + lossLine
+	return statusLine + "\n\n" + delayLine
 }
 
 func (m Model) viewFooter(w int) string {
 	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("#555"))
 	accent := lipgloss.NewStyle().Foreground(lipgloss.Color("#888"))
 
-	// Left: full proxy address
 	proxyAddr := accent.Render(fmt.Sprintf("socks5://localhost:%d", m.proxyPort))
 
-	// Mode indicator (if any)
+	// Mode and speed are both shown, so a paused ride still says how fast it will run.
 	var mode string
-	if m.train.Paused {
+	if m.ride.IsPaused() {
 		mode = lipgloss.NewStyle().Foreground(ColorDegrading).Bold(true).Render("PAUSED")
-	} else if m.train.ManualMode {
-		mode = lipgloss.NewStyle().Foreground(ColorRecovering).Bold(true).Render("MANUAL")
-	} else if m.train.Speed != 1.0 {
-		mode = dim.Render(fmt.Sprintf("%.1fx", m.train.Speed))
+	}
+	if speed := m.ride.Speed(); speed != 1.0 {
+		mode = strings.TrimSpace(mode + " " + dim.Render(fmt.Sprintf("%.1fx", speed)))
 	}
 
-	// Right: uptime
 	uptime := time.Since(m.startTime).Round(time.Second)
 	uptimeStr := accent.Render(fmt.Sprintf("Up %dm%02ds", int(uptime.Minutes()), int(uptime.Seconds())%60))
 
-	// Build line with proper spacing
 	left := proxyAddr
 	right := uptimeStr
-
 	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
 	if mode != "" {
 		gap = gap - lipgloss.Width(mode) - 2
@@ -580,10 +479,9 @@ func (m Model) viewFooter(w int) string {
 		line = left + strings.Repeat(" ", gap) + right
 	}
 
-	// Help hints
 	help := dim.Render("spc") + accent.Render(" pause  ") +
+		dim.Render("n") + accent.Render(" next  ") +
 		dim.Render("←→") + accent.Render(" speed  ") +
-		dim.Render("m") + accent.Render(" manual  ") +
 		dim.Render("q") + accent.Render(" quit")
 
 	helpPad := (w - lipgloss.Width(help)) / 2
@@ -592,12 +490,4 @@ func (m Model) viewFooter(w int) string {
 	}
 
 	return line + "\n\n" + strings.Repeat(" ", helpPad) + help
-}
-
-func (m Model) GetCondition() sim.NetworkCondition {
-	return m.condition
-}
-
-func (m Model) GetTrain() *sim.Train {
-	return m.train
 }

@@ -32,19 +32,21 @@ type outLine struct {
 }
 
 type outStation struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	ShortName  string `json:"short_name"`
-	HasService bool   `json:"has_service"`
-	DwellMS    int64  `json:"dwell_ms"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	ShortName string `json:"short_name"`
+	DwellMS   int64  `json:"dwell_ms"`
+	// From the MTA Subway Stations dataset: "Subway" (underground), "Elevated", "At Grade",
+	// "Open Cut", "Embankment", or "Viaduct". Empty when the station is not in that dataset.
+	Structure string `json:"structure,omitempty"`
 }
 
 type outSegment struct {
-	FromID      string  `json:"from_id"`
-	ToID        string  `json:"to_id"`
-	IsTunnel    bool    `json:"is_tunnel"`
-	DurationMS  int64   `json:"duration_ms"`
-	Degradation float64 `json:"degradation"`
+	FromID     string `json:"from_id"`
+	ToID       string `json:"to_id"`
+	DurationMS int64  `json:"duration_ms"`
+	// False for a tunnel between two underground stations without cell coverage.
+	HasService bool `json:"has_service"`
 }
 
 type routeInfo struct {
@@ -97,9 +99,11 @@ func main() {
 	var weekdayOnly bool
 	var timeStartHHMM string
 	var timeEndHHMM string
+	var stationsPath string
 
-	flag.StringVar(&inPath, "in", "", "path to MTA GTFS zip (e.g. google_transit.zip)")
-	flag.StringVar(&outPath, "out", "xcode/TrainGapRecorder/TrainGapRecorder/lines.json", "output lines.json path")
+	flag.StringVar(&inPath, "in", "", "path to MTA GTFS zip (e.g. google_transit.zip); without it, only the existing file is annotated")
+	flag.StringVar(&outPath, "out", "internal/lines/lines.json", "output lines.json path (the Xcode project links to this file)")
+	flag.StringVar(&stationsPath, "stations", "", "path to the MTA Subway Stations CSV (https://data.ny.gov/d/39hk-dx4f), for station structure and tunnel service")
 	flag.StringVar(&routesCSV, "routes", defaultRoutesCSV(), "comma-separated route short names to include (e.g. A,C,F,3,4,5)")
 	flag.BoolVar(&listRoutes, "list-routes", false, "list available GTFS routes and exit")
 	flag.BoolVar(&replaceExisting, "replace-existing", false, "replace an existing line with the GTFS-generated one (default: keep existing)")
@@ -108,9 +112,80 @@ func main() {
 	flag.StringVar(&timeEndHHMM, "time-end", "16:00", "only consider trips starting before this local time (HH:MM)")
 	flag.Parse()
 
-	if inPath == "" {
-		fatal(errors.New("missing -in"))
+	if inPath == "" && stationsPath == "" {
+		fatal(errors.New("give -in (GTFS zip), -stations (MTA Subway Stations CSV), or both"))
 	}
+
+	generatedByID := map[string]outLine{}
+	var warnings []string
+	if inPath != "" {
+		generatedByID, warnings = generateLines(inPath, routesCSV, listRoutes, weekdayOnly, timeStartHHMM, timeEndHHMM)
+	}
+
+	var out outBundle
+	out.GeneratedAt = time.Now().UTC().Format(time.RFC3339)
+	existingByID := map[string]outLine{}
+	if b, err := readExistingBundle(outPath); err == nil {
+		for _, l := range b.Lines {
+			if l.ID != "" {
+				existingByID[l.ID] = l
+			}
+		}
+	}
+
+	unionIDs := map[string]struct{}{}
+	for id := range generatedByID {
+		unionIDs[id] = struct{}{}
+	}
+	for id := range existingByID {
+		unionIDs[id] = struct{}{}
+	}
+	var ids []string
+	for id := range unionIDs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	for _, id := range ids {
+		existing, hasExisting := existingByID[id]
+		gen, hasGen := generatedByID[id]
+
+		switch {
+		case hasGen && hasExisting && !replaceExisting:
+			out.Lines = append(out.Lines, existing)
+		case hasGen:
+			out.Lines = append(out.Lines, gen)
+		case hasExisting:
+			out.Lines = append(out.Lines, existing)
+		}
+	}
+
+	if stationsPath != "" {
+		structureByStopID, err := readStationStructures(stationsPath)
+		if err != nil {
+			fatal(err)
+		}
+		warnings = append(warnings, annotateStructureAndService(out.Lines, structureByStopID)...)
+	}
+
+	for _, w := range uniqueSorted(warnings) {
+		fmt.Fprintln(os.Stderr, "warning:", w)
+	}
+
+	enc, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		fatal(fmt.Errorf("marshal output: %w", err))
+	}
+	enc = append(enc, '\n')
+
+	if err := os.WriteFile(outPath, enc, 0o644); err != nil {
+		fatal(fmt.Errorf("write %s: %w", outPath, err))
+	}
+}
+
+// generateLines builds one line per selected route from the GTFS zip, using a typical
+// weekday trip. It returns the lines by ID and any warnings.
+func generateLines(inPath, routesCSV string, listRoutes, weekdayOnly bool, timeStartHHMM, timeEndHHMM string) (map[string]outLine, []string) {
 
 	z, err := zip.OpenReader(inPath)
 	if err != nil {
@@ -125,7 +200,7 @@ func main() {
 
 	if listRoutes {
 		printRoutes(routesByID)
-		return
+		os.Exit(0)
 	}
 
 	selected := parseCSVSet(routesCSV)
@@ -167,9 +242,6 @@ func main() {
 	}
 	warnings = append(warnings, moreWarnings...)
 
-	var out outBundle
-	out.GeneratedAt = time.Now().UTC().Format(time.RFC3339)
-
 	// Build output lines in stable order.
 	generatedByID := map[string]outLine{}
 	for short := range selected {
@@ -190,56 +262,7 @@ func main() {
 		line := buildLine(route, bt)
 		generatedByID[line.ID] = line
 	}
-
-	existingByID := map[string]outLine{}
-	if b, err := readExistingBundle(outPath); err == nil {
-		for _, l := range b.Lines {
-			if l.ID != "" {
-				existingByID[l.ID] = l
-			}
-		}
-	}
-
-	unionIDs := map[string]struct{}{}
-	for id := range generatedByID {
-		unionIDs[id] = struct{}{}
-	}
-	for id := range existingByID {
-		unionIDs[id] = struct{}{}
-	}
-	var ids []string
-	for id := range unionIDs {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-
-	for _, id := range ids {
-		existing, hasExisting := existingByID[id]
-		gen, hasGen := generatedByID[id]
-
-		switch {
-		case hasGen && hasExisting && !replaceExisting:
-			out.Lines = append(out.Lines, existing)
-		case hasGen:
-			out.Lines = append(out.Lines, gen)
-		case hasExisting:
-			out.Lines = append(out.Lines, existing)
-		}
-	}
-
-	for _, w := range uniqueSorted(warnings) {
-		fmt.Fprintln(os.Stderr, "warning:", w)
-	}
-
-	enc, err := json.MarshalIndent(out, "", "  ")
-	if err != nil {
-		fatal(fmt.Errorf("marshal output: %w", err))
-	}
-	enc = append(enc, '\n')
-
-	if err := os.WriteFile(outPath, enc, 0o644); err != nil {
-		fatal(fmt.Errorf("write %s: %w", outPath, err))
-	}
+	return generatedByID, warnings
 }
 
 func readExistingBundle(path string) (outBundle, error) {
@@ -278,11 +301,10 @@ func buildLine(route routeInfo, bt bestTrip) outLine {
 			dwell = 35_000
 		}
 		stations = append(stations, outStation{
-			ID:         st.StationID,
-			Name:       st.StationName,
-			ShortName:  st.ShortName,
-			HasService: true,
-			DwellMS:    dwell,
+			ID:        st.StationID,
+			Name:      st.StationName,
+			ShortName: st.ShortName,
+			DwellMS:   dwell,
 		})
 	}
 
@@ -292,11 +314,10 @@ func buildLine(route routeInfo, bt bestTrip) outLine {
 		to := bt.Stations[i+1]
 		dur := inferSegmentDurationMS(from, to)
 		segments = append(segments, outSegment{
-			FromID:      from.StationID,
-			ToID:        to.StationID,
-			IsTunnel:    false,
-			DurationMS:  dur,
-			Degradation: 0.7,
+			FromID:     from.StationID,
+			ToID:       to.StationID,
+			DurationMS: dur,
+			HasService: true, // -stations sets false for tunnels without coverage.
 		})
 	}
 
@@ -1212,4 +1233,71 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// wiredTunnels lists tunnels between two underground stations that have cell service for
+// AT&T, Verizon, and T-Mobile. Keys are GTFS stop IDs in either order.
+// Canarsie tunnel (L, 1 Av - Bedford Av): MTA press releases, 2020-21.
+// Other wired tunnels (Joralemon St, 42 St Shuttle, parts of the G) were announced for AT&T
+// only, so they stay without service here until recordings show otherwise.
+var wiredTunnels = map[[2]string]bool{
+	{"L06", "L08"}: true,
+}
+
+// readStationStructures reads the MTA Subway Stations CSV and returns each GTFS stop ID's
+// structure ("Subway", "Elevated", ...).
+func readStationStructures(path string) (map[string]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open stations CSV: %w", err)
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	header, err := readHeader(reader)
+	if err != nil {
+		return nil, fmt.Errorf("stations CSV: %w", err)
+	}
+	stopIDColumn := mustIndex(header, "GTFS Stop ID")
+	structureColumn := mustIndex(header, "Structure")
+
+	structureByStopID := map[string]string{}
+	for {
+		row, err := reader.Read()
+		if errors.Is(err, io.EOF) {
+			return structureByStopID, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("stations CSV: %w", err)
+		}
+		structureByStopID[field(row, stopIDColumn)] = field(row, structureColumn)
+	}
+}
+
+// annotateStructureAndService sets each station's structure and marks a segment without
+// service when both of its stations are underground ("Subway") and the tunnel is not wired.
+// Recorded rides on the 3 train (2026-10) showed no service in any such tunnel.
+// It returns a warning for each station that is not in the CSV.
+func annotateStructureAndService(lines []outLine, structureByStopID map[string]string) []string {
+	var warnings []string
+	for lineIndex := range lines {
+		line := &lines[lineIndex]
+		structureByStationID := map[string]string{}
+		for stationIndex := range line.Stations {
+			station := &line.Stations[stationIndex]
+			structure, found := structureByStopID[station.ID]
+			if !found {
+				warnings = append(warnings, fmt.Sprintf("line %s: station %s (%s) is not in the stations CSV", line.ID, station.ID, station.Name))
+			}
+			station.Structure = structure
+			structureByStationID[station.ID] = structure
+		}
+		for segmentIndex := range line.Segments {
+			segment := &line.Segments[segmentIndex]
+			isUnderground := structureByStationID[segment.FromID] == "Subway" && structureByStationID[segment.ToID] == "Subway"
+			isWired := wiredTunnels[[2]string{segment.FromID, segment.ToID}] || wiredTunnels[[2]string{segment.ToID, segment.FromID}]
+			segment.HasService = !isUnderground || isWired
+		}
+	}
+	return warnings
 }

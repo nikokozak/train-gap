@@ -9,7 +9,7 @@ Open:
 
 Key paths:
 - App code: `xcode/TrainGapRecorder/TrainGapRecorder/`
-- Route dataset (bundled): `xcode/TrainGapRecorder/TrainGapRecorder/lines.json`
+- Route dataset (bundled): `TrainGapRecorder/lines.json`, a symlink to `internal/lines/lines.json`, which the simulator uses too
 
 ## Run on your iPhone
 
@@ -34,22 +34,6 @@ Summarize:
 go run ./cmd/recording-summarize -- path/to/session.ndjson
 ```
 
-## Generate a full NYC station dataset (GTFS import)
+## Station dataset
 
-Download the MTA Subway GTFS zip (`google_transit.zip`) and run:
-
-```bash
-go run ./cmd/lines-gtfs -in /path/to/google_transit.zip -replace-existing
-```
-
-This overwrites the app’s bundled `lines.json`.
-
-Notes:
-- The importer prefers a **weekday/daytime** stop pattern and tries to avoid “late-night local” or one-off reroutes that can add stations your train doesn’t actually stop at.
-- If you need a different profile, see `go run ./cmd/lines-gtfs -h` (e.g. `-weekday-only=false` or a wider `-time-start/-time-end` window).
-
-If you want the Go simulator to use the exact same dataset:
-
-```bash
-go run ./cmd/lines-sync
-```
+The app and the simulator share `internal/lines/lines.json`. To rebuild it, see "Station dataset" in `docs/recordings.md`.

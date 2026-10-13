@@ -2,51 +2,44 @@ package lines
 
 import "testing"
 
-func TestLTrainIntegrity(t *testing.T) {
-	line := GetLine("L")
-	if line == nil {
-		t.Fatalf("expected GetLine(%q) to return a line", "L")
+// The simulator walks Segments by index, so every line must have one segment per pair of
+// neighbouring stations, in order.
+func TestDataset(t *testing.T) {
+	if len(IDs()) == 0 {
+		t.Fatal("no lines in the embedded dataset")
 	}
-	if len(line.Stations) < 2 {
-		t.Fatalf("expected at least 2 stations; got %d", len(line.Stations))
-	}
-
-	seen := make(map[string]struct{}, len(line.Stations))
-	for i, st := range line.Stations {
-		if st.ID == "" {
-			t.Fatalf("station %d has empty ID", i)
+	for _, id := range IDs() {
+		line := Get(id)
+		if len(line.Stations) < 2 {
+			t.Fatalf("line %s: %d stations; want at least 2", id, len(line.Stations))
 		}
-		if _, ok := seen[st.ID]; ok {
-			t.Fatalf("duplicate station ID %q", st.ID)
+		if len(line.Segments) != len(line.Stations)-1 {
+			t.Fatalf("line %s: %d segments for %d stations", id, len(line.Segments), len(line.Stations))
 		}
-		seen[st.ID] = struct{}{}
-	}
-
-	for i := 0; i < len(line.Stations)-1; i++ {
-		from := line.Stations[i]
-		to := line.Stations[i+1]
-		seg := line.GetSegment(from.ID, to.ID)
-		if seg == nil {
-			t.Fatalf("missing segment %q -> %q", from.ID, to.ID)
-		}
-		if seg.Duration <= 0 {
-			t.Fatalf("segment %q -> %q has non-positive duration %v", from.ID, to.ID, seg.Duration)
-		}
-		if seg.Degradation < 0 || seg.Degradation > 1 {
-			t.Fatalf("segment %q -> %q has degradation out of range: %f", from.ID, to.ID, seg.Degradation)
+		for index, segment := range line.Segments {
+			if segment.FromID != line.Stations[index].ID || segment.ToID != line.Stations[index+1].ID {
+				t.Fatalf("line %s: segment %d is %s->%s; want %s->%s", id, index,
+					segment.FromID, segment.ToID, line.Stations[index].ID, line.Stations[index+1].ID)
+			}
+			if segment.Duration <= 0 {
+				t.Fatalf("line %s: segment %s->%s has no duration", id, segment.FromID, segment.ToID)
+			}
 		}
 	}
 }
 
-func TestAvailableLinesIncludesL(t *testing.T) {
-	found := false
-	for _, id := range AvailableLines() {
-		if id == "L" {
-			found = true
-			break
-		}
+// The L's East River (Canarsie) tunnel has service; the tunnels under 14 St do not.
+func TestLTrainTunnels(t *testing.T) {
+	line := Get("L")
+	if line == nil {
+		t.Fatal(`Get("L") = nil`)
 	}
-	if !found {
-		t.Fatalf("expected AvailableLines to include %q", "L")
+	for _, segment := range line.Segments {
+		switch {
+		case segment.FromID == "L06" && segment.ToID == "L08" && !segment.HasService:
+			t.Fatal("Canarsie tunnel (1 Av - Bedford Av) has no service; want service")
+		case segment.FromID == "L05" && segment.ToID == "L06" && segment.HasService:
+			t.Fatal("3 Av - 1 Av has service; want a tunnel without service")
+		}
 	}
 }

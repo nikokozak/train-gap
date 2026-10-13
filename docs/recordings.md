@@ -89,25 +89,16 @@ Each row is one second: the jolt, the smoothed jolt, the jolt relative to the ri
 
 ## Next processing step (how Train-Gap can use it)
 
-The labelled segments and stops, with their probe statistics, become a timeline that the simulator replays: per segment, the share of successful probes and the round-trip times of the successful ones.
+Not built yet: the simulator replaying a recording. The labelled segments and stops, with their probe statistics, would become its timeline: per segment, the share of successful probes and the round-trip times of the successful ones. Today the simulator uses a model whose timings come from these recordings (see `internal/sim/timeline.go`).
 
-## Keeping the Go simulator in sync with the iPhone route dataset (optional)
+## Station dataset
 
-The iPhone app bundles `xcode/TrainGapRecorder/TrainGapRecorder/lines.json`. If you want the Go simulator to use the exact same dataset:
+One file, `internal/lines/lines.json`, serves both apps. The simulator embeds it; the Xcode project links to it (`xcode/TrainGapRecorder/TrainGapRecorder/lines.json` is a symlink). Station IDs are GTFS stop IDs, so recordings and the simulator use the same IDs.
 
-```bash
-go run ./cmd/lines-sync
-```
-
-This writes `internal/lines/lines.json`, which `internal/lines` loads at runtime.
-
-## Generating a full NYC dataset (GTFS import)
-
-If you want the full station list for major services (A/C/E, 1–7, N/Q/R/W, etc.), import from the MTA GTFS zip:
+To rebuild it from the [MTA GTFS zip](https://new.mta.info/developers) and the [MTA Subway Stations CSV](https://data.ny.gov/d/39hk-dx4f):
 
 ```bash
-go run ./cmd/lines-gtfs -in /path/to/google_transit.zip
+go run ./cmd/lines-gtfs -in /path/to/google_transit.zip -stations /path/to/MTA_Subway_Stations.csv -replace-existing
 ```
 
-By default this overwrites the recorder’s bundled `lines.json` at:
-- `xcode/TrainGapRecorder/TrainGapRecorder/lines.json`
+With `-stations` alone, the tool only updates the existing file. A segment between two underground stations is a tunnel without service, unless the tool lists it as wired. The only wired tunnel listed is the L's Canarsie tunnel, which has service on AT&T, Verizon, and T-Mobile.
