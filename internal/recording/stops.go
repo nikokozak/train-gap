@@ -359,7 +359,7 @@ type Detection struct {
 	// Stretches without service long enough to be a tunnel. On lines without tunnel coverage,
 	// one per segment.
 	TunnelGaps int
-	// Calibration check: marks should fall in detected stops (within 3 s), not inside runs.
+	// Calibration check: station marks should fall in detected stops (within 3 s), not inside runs.
 	MarksNearStops int
 }
 
@@ -410,11 +410,15 @@ func DetectStops(recording Recording, settings Settings) Detection {
 	return detection
 }
 
-// countMarksNearStops is the calibration check: the rider taps Mark when the doors open, so with
-// good settings every mark falls in a stop, or within markToleranceMS of one.
+// countMarksNearStops is the calibration check: the rider taps Station when the doors open, so
+// with good settings every station mark falls in a stop, or within markToleranceMS of one.
+// Anomaly marks do not count.
 func countMarksNearStops(marks []Mark, runs []TimeSpan) int {
 	count := 0
 	for _, mark := range marks {
+		if !mark.IsStation() {
+			continue
+		}
 		insideRun := false
 		for _, run := range runs {
 			if mark.TMS >= run.StartMS+markToleranceMS && mark.TMS < run.EndMS-markToleranceMS {

@@ -202,9 +202,10 @@ func TestDetectStopsWithoutMotion(t *testing.T) {
 func TestCountMarksNearStops(t *testing.T) {
 	runs := []TimeSpan{{20_000, 80_000}, {95_000, 155_000}}
 	marks := []Mark{
-		{TMS: 90_000},  // In the stop at B.
-		{TMS: 93_000},  // 2 s before departure: within tolerance.
-		{TMS: 120_000}, // Mid-run: the detection missed a stop here.
+		{TMS: 90_000},                    // In the stop at B.
+		{TMS: 93_000},                    // 2 s before departure: within tolerance.
+		{TMS: 120_000},                   // Mid-run: the detection missed a stop here.
+		{TMS: 30_000, Kind: MarkAnomaly}, // Mid-run, but an anomaly mark does not count.
 	}
 	if got := countMarksNearStops(marks, runs); got != 2 {
 		t.Fatalf("countMarksNearStops() = %d; want 2", got)

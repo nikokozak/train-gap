@@ -1,3 +1,4 @@
+import ActivityKit
 import CoreLocation
 import CoreMotion
 import CoreTelephony
@@ -23,6 +24,8 @@ final class Recorder: ObservableObject {
     static let staleSampleAge: TimeInterval = probeTimeout + 2.0
     /// Accelerometer rate. 20 Hz shows train vibration and braking; about 1.5 MB per 40-minute ride.
     static let motionHz = 20
+    /// The service strip on the ride screen shows this many recent probes, one per second.
+    static let serviceHistoryLength = 60
 
     /// Rotated round-robin so that no single endpoint rate-limits us.
     static let probeURLs = [
@@ -40,7 +43,12 @@ final class Recorder: ObservableObject {
     @Published private(set) var startedAt: Date?
     @Published private(set) var sampleCount = 0
     @Published private(set) var probeOKCount = 0
-    @Published private(set) var markCount = 0
+    @Published private(set) var stationMarkCount = 0
+    @Published private(set) var anomalyMarkCount = 0
+    /// The last mark, for the "Station marked" confirmation. A new mark replaces it.
+    @Published private(set) var lastMark: MarkConfirmation?
+    /// Recent probe results, oldest first: true when the probe got through.
+    @Published private(set) var serviceHistory: [Bool] = []
     @Published private(set) var lastSample: RecorderSample?
     /// `clockSeconds()` when the last sample reached the file. The UI shows "saved N s ago" from it.
     @Published private(set) var lastSavedSampleTime: TimeInterval?
@@ -84,6 +92,9 @@ final class Recorder: ObservableObject {
     private var probeCursor = 0
     private var probeBackoff: [URL: ProbeBackoffState] = [:]
 
+    /// The lock screen view of the ride. Nil when Live Activities are off in Settings.
+    private var activity: Activity<RecordingActivityAttributes>?
+
     // MARK: - Ride controls
 
     /// Asks for location access once. Call it before the ride, so the prompt does not appear on the platform.
@@ -121,7 +132,10 @@ final class Recorder: ObservableObject {
         stopTappedTime = nil
         sampleCount = 0
         probeOKCount = 0
-        markCount = 0
+        stationMarkCount = 0
+        anomalyMarkCount = 0
+        lastMark = nil
+        serviceHistory = []
         lastSample = nil
         lastSavedSampleTime = nil
         motionReadingsPerSecond = 0
@@ -136,17 +150,24 @@ final class Recorder: ObservableObject {
         // Without location access, iOS suspends the app when the screen locks. Keep the screen on instead.
         UIApplication.shared.isIdleTimerDisabled = !canRecordWhileLocked
         tickLoopTask = Task { await runTickLoop() }
+        startActivity(line: line, config: config, startedAt: startDate)
         playHaptic()
         return true
     }
 
-    /// Writes a timestamp. Optional: the rider may tap it when the doors open.
-    func mark() async {
+    /// Writes a timestamp of this kind. Optional: Station when the doors open, Anomaly when
+    /// something unusual happens. Called from the ride screen and from the lock screen.
+    func mark(_ kind: MarkKind) async {
         guard isRecording else { return }
-        if await write(RecorderMark(tMS: nowTMS())) {
-            markCount += 1
-            playHaptic()
+        let tMS = nowTMS()
+        guard await write(RecorderMark(tMS: tMS, kind: kind.rawValue)) else { return }
+        switch kind {
+        case .station: stationMarkCount += 1
+        case .anomaly: anomalyMarkCount += 1
         }
+        lastMark = MarkConfirmation(kind: kind, elapsedSeconds: tMS / 1000)
+        playHaptic()  // No effect while the app is in the background; the lock screen view updates instead.
+        await updateActivity()
     }
 
     /// Remembers when the rider tapped Stop. Recording continues until `finish` or `cancelStop`.
@@ -186,7 +207,7 @@ final class Recorder: ObservableObject {
             endStationName: endStation?.shortName,
             endStationIndex: endStation == nil ? nil : endStationIndex,
             note: note,
-            summary: RecorderSessionSummary(marks: markCount, samples: sampleCount, probeOK: probeOKCount)
+            summary: RecorderSessionSummary(marks: stationMarkCount + anomalyMarkCount, samples: sampleCount, probeOK: probeOKCount)
         )
 
         do {
@@ -199,6 +220,7 @@ final class Recorder: ObservableObject {
         }
         await finishingWriter.close()
         stopTappedTime = nil
+        await endActivity()
     }
 
     // MARK: - Tick loop
@@ -266,8 +288,13 @@ final class Recorder: ObservableObject {
             if probe.ok {
                 probeOKCount += 1
             }
+            let hadService = serviceHistory.last
+            serviceHistory = Array((serviceHistory + [probe.ok]).suffix(Self.serviceHistoryLength))
             lastSample = sample
             lastSavedSampleTime = Self.clockSeconds()
+            if hadService != probe.ok {
+                await updateActivity()
+            }
         }
     }
 
@@ -467,6 +494,49 @@ final class Recorder: ObservableObject {
         backgroundActivitySession = nil
     }
 
+    // MARK: - Live Activity (lock screen and Dynamic Island)
+
+    /// Ends Live Activities left from a ride that did not finish, for example when iOS ended the app.
+    static func endStaleActivities() async {
+        for staleActivity in Activity<RecordingActivityAttributes>.activities {
+            await staleActivity.end(nil, dismissalPolicy: .immediate)
+        }
+    }
+
+    private func startActivity(line: Line, config: SessionConfig, startedAt: Date) {
+        // Off when the rider turned Live Activities off in Settings; the recording does not need it.
+        guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
+        let attributes = RecordingActivityAttributes(
+            lineID: config.lineID,
+            lineColorHex: line.color,
+            directionLabel: config.directionLabel,
+            startedAt: startedAt
+        )
+        // A failure only means no lock screen view; the recording goes on.
+        activity = try? Activity.request(attributes: attributes, content: ActivityContent(state: activityState, staleDate: nil))
+    }
+
+    private var activityState: RecordingActivityAttributes.ContentState {
+        RecordingActivityAttributes.ContentState(
+            hasService: serviceHistory.last ?? true,
+            stationMarkCount: stationMarkCount,
+            anomalyMarkCount: anomalyMarkCount,
+            lastMarkKind: lastMark?.kind,
+            lastMarkElapsedSeconds: lastMark?.elapsedSeconds
+        )
+    }
+
+    /// Sends the current state to the lock screen. Called only when it changes: on a mark, and
+    /// when service is lost or comes back.
+    private func updateActivity() async {
+        await activity?.update(ActivityContent(state: activityState, staleDate: nil))
+    }
+
+    private func endActivity() async {
+        await activity?.end(ActivityContent(state: activityState, staleDate: nil), dismissalPolicy: .immediate)
+        activity = nil
+    }
+
     // MARK: - Time
 
     /// Seconds on a clock that keeps counting while the phone sleeps. Every event time uses it,
@@ -548,6 +618,13 @@ final class Recorder: ObservableObject {
     private func playHaptic() {
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     }
+}
+
+/// A mark that was saved, for the confirmation pill.
+struct MarkConfirmation: Equatable {
+    let id = UUID()  // Two marks of the same kind in the same second are still two confirmations.
+    let kind: MarkKind
+    let elapsedSeconds: Int
 }
 
 /// Accelerometer readings collected between two ticks.

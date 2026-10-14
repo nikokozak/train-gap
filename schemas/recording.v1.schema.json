@@ -190,12 +190,16 @@
       "additionalProperties": false
     },
     "mark": {
-      "$comment": "The rider tapped Mark (optional, for example when doors open). A timestamp only, with no station label.",
+      "$comment": "The rider tapped a mark button, in the app or on the lock screen (optional). A timestamp only, with no station label.",
       "type": "object",
       "required": ["type", "t_ms"],
       "properties": {
         "type": { "const": "mark" },
-        "t_ms": { "type": "integer", "minimum": 0 }
+        "t_ms": { "type": "integer", "minimum": 0 },
+        "kind": {
+          "enum": ["station", "anomaly"],
+          "$comment": "station: the doors opened at a station. anomaly: something unusual, for example the train stopped between stations. Absent in recordings before 2026-10-14: a station mark."
+        }
       },
       "additionalProperties": false
     },

@@ -9,6 +9,8 @@ Open:
 
 Key paths:
 - App code: `xcode/TrainGapRecorder/TrainGapRecorder/`
+- Lock screen and Dynamic Island (widget extension `TrainGapRecorderWidgets`): `xcode/TrainGapRecorder/TrainGapRecorderWidgets/`
+- Shared by both targets (Live Activity data, the mark buttons' intent, the line bullet): `xcode/TrainGapRecorder/Shared/`
 - Route dataset (bundled): `TrainGapRecorder/lines.json`, a symlink to `internal/lines/lines.json`, which the simulator uses too
 
 ## Run on your iPhone

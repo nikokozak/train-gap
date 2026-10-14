@@ -64,9 +64,21 @@ type MotionBatch struct {
 	ZMilliG []int `json:"z_mg"`
 }
 
-// Mark is a `mark` event: the rider tapped Mark (optional, usually when the doors open).
+// Mark is a `mark` event: the rider tapped a mark button (optional).
 type Mark struct {
-	TMS int64 `json:"t_ms"`
+	TMS  int64  `json:"t_ms"`
+	Kind string `json:"kind"` // MarkStation, MarkAnomaly, or empty (recorder builds before 2026-10-14: a station mark).
+}
+
+// Mark kinds.
+const (
+	MarkStation = "station" // The doors opened at a station.
+	MarkAnomaly = "anomaly" // Something unusual, for example the train stopped between stations.
+)
+
+// IsStation reports a station mark.
+func (mark Mark) IsStation() bool {
+	return mark.Kind == "" || mark.Kind == MarkStation
 }
 
 // SessionEnd is the last event.

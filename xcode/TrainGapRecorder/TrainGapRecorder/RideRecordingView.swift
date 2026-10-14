@@ -1,7 +1,8 @@
 import SwiftUI
 
-/// The screen during a ride. Quiet on purpose: the rider only needs to see that recording
-/// is healthy. Stops and station labels are worked out after the ride.
+/// The screen during a ride. The rider only needs to see that recording is healthy and where the
+/// mark buttons are; stops and station labels are worked out after the ride. The same buttons
+/// are on the lock screen (RecordingLiveActivity).
 struct RideRecordingView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var recorder: Recorder
@@ -9,15 +10,20 @@ struct RideRecordingView: View {
     var onFinished: (() -> Void)?
 
     @State private var isShowingFinishSheet = false
+    /// The mark the confirmation pill shows. It hides itself after `confirmationSeconds`.
+    @State private var confirmedMark: MarkConfirmation?
+
+    /// Long enough to read with a glance down on a moving train.
+    private static let confirmationSeconds = 3.0
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 24) {
+            VStack(spacing: 20) {
                 routeHeader
 
                 // Redraws every second so the elapsed time and the sample age stay current.
                 TimelineView(.periodic(from: .now, by: 1)) { context in
-                    statusPanel(now: context.date)
+                    statusCard(now: context.date)
                 }
 
                 warnings
@@ -33,6 +39,25 @@ struct RideRecordingView: View {
             controls
                 .padding()
                 .background(.bar)
+        }
+        .overlay(alignment: .top) {
+            if let confirmedMark {
+                MarkConfirmationPill(mark: confirmedMark)
+                    .padding(.top, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        // Marks from the lock screen arrive here too, so the pill shows whichever button was used.
+        .onChange(of: recorder.lastMark) { _, mark in
+            withAnimation(.snappy) { confirmedMark = mark }
+            if let mark {
+                AccessibilityNotification.Announcement("\(mark.kind.buttonTitle) marked").post()
+            }
+        }
+        .task(id: confirmedMark?.id) {
+            guard confirmedMark != nil else { return }
+            try? await Task.sleep(for: .seconds(Self.confirmationSeconds))  // Throws only when a newer mark replaces this one.
+            withAnimation(.snappy) { confirmedMark = nil }
         }
         // No tab switching during a ride; it also gives the buttons the bottom of the screen.
         .toolbar(.hidden, for: .tabBar)
@@ -63,16 +88,48 @@ struct RideRecordingView: View {
         }
     }
 
-    private func statusPanel(now: Date) -> some View {
-        VStack(spacing: 8) {
-            Label(recorder.isRecording ? "Recording" : "Stopped", systemImage: "circle.fill")
-                .font(.largeTitle.bold())
-                .foregroundStyle(recorder.isRecording ? .red : .secondary)
-            Text(elapsedText(now: now))
-                .font(.title2.monospacedDigit())
-            Text(sampleAgeText)
-                .foregroundStyle(isSampleStale(now: now) ? .red : .secondary)
+    /// Recording state, elapsed time, the signal now, the last minute of service, and the marks.
+    private func statusCard(now: Date) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                Label(recorder.isRecording ? "Recording" : "Stopped", systemImage: "record.circle")
+                    .font(.headline)
+                    .foregroundStyle(recorder.isRecording ? .red : .secondary)
+                Spacer()
+                Text(elapsedText(now: now))
+                    .font(.system(.largeTitle, design: .rounded).monospacedDigit().bold())
+            }
+
+            HStack(alignment: .center, spacing: 10) {
+                SignalBars(bars: signalBars, color: serviceColor)
+                Text(serviceText)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(serviceColor)
+                Spacer()
+                Text(sampleAgeText)
+                    .font(.footnote)
+                    .foregroundStyle(isSampleStale(now: now) ? .red : .secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                ServiceStrip(history: recorder.serviceHistory)
+                Text("Service in the last minute. Red is a second without service.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 20) {
+                Label("\(recorder.stationMarkCount)", systemImage: MarkKind.station.systemImage)
+                    .accessibilityLabel("\(recorder.stationMarkCount) station marks")
+                Label("\(recorder.anomalyMarkCount)", systemImage: MarkKind.anomaly.systemImage)
+                    .accessibilityLabel("\(recorder.anomalyMarkCount) anomaly marks")
+                Spacer()
+            }
+            .font(.callout.monospacedDigit())
+            .foregroundStyle(.secondary)
         }
+        .padding()
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 16))
     }
 
     private var warnings: some View {
@@ -97,7 +154,6 @@ struct RideRecordingView: View {
             DetailRow(name: "Samples", value: "\(recorder.sampleCount)")
             DetailRow(name: "Probe OK", value: "\(recorder.probeOKCount) (\(Int((recorder.probeOKRate * 100).rounded()))%)")
             DetailRow(name: "Motion", value: "\(recorder.motionReadingsPerSecond) readings/s")
-            DetailRow(name: "Marks", value: "\(recorder.markCount)")
             DetailRow(name: "Carrier", value: recorder.config?.carrier ?? "—")
             if let sample = recorder.lastSample {
                 DetailRow(name: "Path", value: "\(sample.path.status) \(sample.path.interface ?? "") \(sample.path.radio ?? "")")
@@ -108,27 +164,24 @@ struct RideRecordingView: View {
     }
 
     private var controls: some View {
-        VStack(spacing: 12) {
-            Button {
-                Task { await recorder.mark() }
-            } label: {
-                Label("Mark", systemImage: "flag")
-                    .font(.title2)
-                    .frame(maxWidth: .infinity, minHeight: 56)
+        VStack(spacing: 10) {
+            HStack(spacing: 12) {
+                markButton(.station)
+                markButton(.anomaly)
             }
-            .buttonStyle(.bordered)
 
-            Text("Optional. Tap when the doors open.")
+            Text("Optional. Station when the doors open; Anomaly when the train stops between stations or something else is odd. Both are on the lock screen too.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
 
             Button(role: .destructive) {
                 recorder.noteStopTapped()
                 isShowingFinishSheet = true
             } label: {
                 Label("Stop", systemImage: "stop.fill")
-                    .font(.title2)
-                    .frame(maxWidth: .infinity, minHeight: 56)
+                    .font(.title3)
+                    .frame(maxWidth: .infinity, minHeight: 48)
             }
             .buttonStyle(.borderedProminent)
             .tint(.red)
@@ -136,12 +189,49 @@ struct RideRecordingView: View {
         .disabled(!recorder.isRecording)
     }
 
+    private func markButton(_ kind: MarkKind) -> some View {
+        Button {
+            Task { await recorder.mark(kind) }
+        } label: {
+            Label(kind.buttonTitle, systemImage: kind.systemImage)
+                .font(.title3)
+                .frame(maxWidth: .infinity, minHeight: 56)
+        }
+        .buttonStyle(.bordered)
+        .tint(kind == .station ? .accentColor : .orange)
+    }
+
+    // MARK: - Signal
+
+    /// Bars from the last probe's round trip. The limits are a display choice, the same as in the
+    /// simulator's terminal view (half of each is its per-direction delay limit).
+    private var signalBars: Int {
+        guard let probe = recorder.lastSample?.probe, probe.ok else { return 0 }
+        let roundTripMS = probe.rttMS ?? 0
+        switch roundTripMS {
+        case 1000...: return 1
+        case 300...: return 2
+        case 120...: return 3
+        default: return 4
+        }
+    }
+
+    private var serviceColor: Color {
+        guard let probe = recorder.lastSample?.probe else { return .secondary }
+        return probe.ok ? (signalBars <= 1 ? .orange : .green) : .red
+    }
+
+    private var serviceText: String {
+        guard let probe = recorder.lastSample?.probe else { return "Waiting…" }
+        guard probe.ok else { return "No service" }
+        return "Service · \(probe.rttMS ?? 0) ms"
+    }
+
     // MARK: - Text
 
     private func elapsedText(now: Date) -> String {
         guard let startedAt = recorder.startedAt else { return "0:00" }
-        let elapsedSeconds = max(0, Int(now.timeIntervalSince(startedAt)))
-        return String(format: "%d:%02d", elapsedSeconds / 60, elapsedSeconds % 60)
+        return formatElapsed(seconds: max(0, Int(now.timeIntervalSince(startedAt))))
     }
 
     private var sampleAge: TimeInterval? {
@@ -149,8 +239,8 @@ struct RideRecordingView: View {
     }
 
     private var sampleAgeText: String {
-        guard let sampleAge else { return "Waiting for the first sample…" }
-        return "Last sample saved \(Int(sampleAge)) s ago"
+        guard let sampleAge else { return "No sample yet" }
+        return "Saved \(Int(sampleAge)) s ago"
     }
 
     private func isSampleStale(now: Date) -> Bool {
@@ -169,6 +259,39 @@ struct RideRecordingView: View {
         let roundTrip = probe.rttMS.map { "\($0) ms" } ?? "—"
         let newConnection = probe.reusedConnection == false ? " new conn" : ""
         return "\(host) \(status) \(roundTrip)\(newConnection)"
+    }
+}
+
+/// "Station marked · 4:12": confirms that a mark reached the file.
+private struct MarkConfirmationPill: View {
+    var mark: MarkConfirmation
+
+    var body: some View {
+        Label("\(mark.kind.buttonTitle) marked · \(formatElapsed(seconds: mark.elapsedSeconds))", systemImage: mark.kind.systemImage)
+            .font(.headline)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+            .background(.regularMaterial, in: Capsule())
+            .shadow(radius: 6, y: 2)
+    }
+}
+
+/// One cell per recent probe, newest at the right: green when it got through, red when not.
+private struct ServiceStrip: View {
+    var history: [Bool]
+
+    var body: some View {
+        let emptyCellCount = Recorder.serviceHistoryLength - history.count
+        HStack(spacing: 1) {
+            ForEach(0..<Recorder.serviceHistoryLength, id: \.self) { index in
+                let historyIndex = index - emptyCellCount
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(historyIndex < 0 ? Color.secondary.opacity(0.15) : (history[historyIndex] ? Color.green : Color.red))
+            }
+        }
+        .frame(height: 16)
+        .accessibilityElement()
+        .accessibilityLabel("Service in the last minute: \(history.filter { $0 }.count) of \(history.count) probes got through")
     }
 }
 
@@ -242,23 +365,6 @@ private struct FinishRideSheet: View {
     }
 }
 
-/// An MTA-style route bullet.
-private struct LineBadge: View {
-    var lineID: String
-    var hexColor: String?
-
-    /// MTA prints black letters on the yellow Broadway-line bullets and white letters on all others.
-    private static let blackTextLines: Set<String> = ["N", "Q", "R", "W"]
-
-    var body: some View {
-        Text(lineID)
-            .font(.title.bold())
-            .foregroundStyle(Self.blackTextLines.contains(lineID) ? .black : .white)
-            .frame(width: 52, height: 52)
-            .background(Circle().fill(Color(hex: hexColor) ?? .gray))
-    }
-}
-
 private struct WarningRow: View {
     var text: String
     var color: Color = .orange
@@ -284,17 +390,5 @@ private struct DetailRow: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.trailing)
         }
-    }
-}
-
-private extension Color {
-    /// Parses "#RRGGBB" (the format in lines.json). Returns nil for anything else.
-    init?(hex: String?) {
-        guard let hex, hex.hasPrefix("#"), hex.count == 7, let value = Int(hex.dropFirst(), radix: 16) else { return nil }
-        self.init(
-            red: Double((value >> 16) & 0xFF) / 255,
-            green: Double((value >> 8) & 0xFF) / 255,
-            blue: Double(value & 0xFF) / 255
-        )
     }
 }

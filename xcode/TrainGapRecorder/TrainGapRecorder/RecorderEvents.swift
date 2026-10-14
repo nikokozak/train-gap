@@ -163,10 +163,13 @@ struct RecorderMotion: Codable {
 struct RecorderMark: Codable {
     var type: RecorderEventType = .mark
     var tMS: Int
+    /// A MarkKind raw value: "station" or "anomaly".
+    var kind: String
 
     enum CodingKeys: String, CodingKey {
         case type
         case tMS = "t_ms"
+        case kind
     }
 }
 

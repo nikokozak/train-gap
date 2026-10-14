@@ -57,9 +57,11 @@ type stopDetection struct {
 	// Stretches without service long enough to be a tunnel. On lines without tunnel coverage,
 	// one per segment.
 	TunnelGaps int `json:"tunnel_gaps"`
-	// Calibration check: marks should fall in detected stops (within 3 s), not inside segments.
+	// Calibration check: station marks should fall in detected stops (within 3 s), not inside segments.
 	Marks          int `json:"marks"`
 	MarksNearStops int `json:"marks_near_stops"`
+	// When the rider marked an anomaly (for example a stop between stations), in seconds into the ride.
+	AnomalyMarksS []int64 `json:"anomaly_marks_s,omitempty"`
 }
 
 // probeStats summarizes the probes that started inside a time window.
@@ -245,8 +247,14 @@ func detectSegments(ride recording.Recording, settings recording.Settings) ([]se
 	detection := &stopDetection{
 		Status:         result.Status,
 		TunnelGaps:     result.TunnelGaps,
-		Marks:          len(ride.Marks),
 		MarksNearStops: result.MarksNearStops,
+	}
+	for _, mark := range ride.Marks {
+		if mark.IsStation() {
+			detection.Marks++
+		} else {
+			detection.AnomalyMarksS = append(detection.AnomalyMarksS, mark.TMS/1000)
+		}
 	}
 	if result.Runs == nil {
 		return nil, nil, detection
@@ -377,7 +385,10 @@ func printSummary(s summary) {
 	if detection := s.StopDetection; detection != nil {
 		fmt.Printf("  stop detection: %s (segments %d, tunnel gaps without service %d)\n", detection.Status, detection.DetectedSegments, detection.TunnelGaps)
 		if detection.Marks > 0 {
-			fmt.Printf("  marks near detected stops: %d of %d\n", detection.MarksNearStops, detection.Marks)
+			fmt.Printf("  station marks near detected stops: %d of %d\n", detection.MarksNearStops, detection.Marks)
+		}
+		for _, seconds := range detection.AnomalyMarksS {
+			fmt.Printf("  anomaly marked at %d:%02d\n", seconds/60, seconds%60)
 		}
 	}
 	if len(s.Segments) > 0 {
@@ -408,7 +419,7 @@ func printSummary(s summary) {
 }
 
 // printEnergyTrace prints one CSV row per second of motion, for tuning the detection flags.
-// With good settings, rows that contain a Mark tap (mark=1) are "still".
+// With good settings, rows that contain a Station tap (mark=station) are "still".
 func printEnergyTrace(path string, settings recording.Settings) error {
 	ride, err := recording.Read(path)
 	if err != nil {
@@ -426,13 +437,16 @@ func printEnergyTrace(path string, settings recording.Settings) error {
 				service = "1"
 			}
 		}
-		hasMark := 0
+		markKind := ""
 		for _, mark := range ride.Marks {
 			if mark.TMS >= second.StartMS && mark.TMS < second.StartMS+1000 {
-				hasMark = 1
+				markKind = recording.MarkStation
+				if !mark.IsStation() {
+					markKind = recording.MarkAnomaly
+				}
 			}
 		}
-		fmt.Printf("%.1f,%.1f,%.1f,%.2f,%s,%d\n", float64(second.StartMS)/1000, second.JoltMilliG, second.SmoothedMilliG, second.RelativeJolt, service, hasMark)
+		fmt.Printf("%.1f,%.1f,%.1f,%.2f,%s,%s\n", float64(second.StartMS)/1000, second.JoltMilliG, second.SmoothedMilliG, second.RelativeJolt, service, markKind)
 	}
 	return nil
 }

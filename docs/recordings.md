@@ -11,8 +11,8 @@ The recorder records evidence, not station labels. You do not mark stations duri
 
 1) Choose **Line**, **Direction**, **Starting station**, and **Carrier**. The app remembers them for the next ride.
 2) On the platform, tap **Start recording**.
-3) Lock the phone and put it away. Recording continues while the phone is locked.
-4) Optional: tap **Mark** when the doors open. A mark is a timestamp only. It helps to check the stop detection.
+3) Lock the phone and put it away. Recording continues while the phone is locked. The lock screen (and the Dynamic Island) shows that it records, the time, and whether there is service.
+4) Optional: tap **Station** when the doors open, and **Anomaly** when something is unusual, for example the train stops between stations. The buttons are in the app and on the lock screen; they work without unlocking. A mark is a timestamp only. "Station marked" confirms each tap. Station marks help to check the stop detection; anomaly marks are listed in the summary.
 5) When you get off, tap **Stop**, then choose the station where you got off. **Not sure** is a valid answer.
 
 Before the first ride:
@@ -32,7 +32,7 @@ One event per line. `t_ms` is milliseconds since the session started. The clock 
 - `session_start`: route, start station, the stations in ride order (`route_stations`), carrier, probe URLs, motion rate
 - `sample`: one network probe per second, plus network path and radio type (LTE, NR)
 - `motion`: one second of accelerometer readings (20 Hz, milli-g, gravity removed)
-- `mark`: the rider tapped Mark
+- `mark`: the rider tapped Station (`"kind": "station"`) or Anomaly (`"kind": "anomaly"`). Recordings before 2026-10-14 have no `kind`: a station mark.
 - `session_end`: Stop time, end station (absent for "Not sure"), and a summary
 
 Recordings from before 2026-10 contain `station_depart`, `station_arrive`, and `undo` markers instead of `motion` and `mark`.
@@ -77,7 +77,7 @@ The result is in `stop_detection.status`:
 
 ### Checking and tuning (calibration ride)
 
-On a calibration ride, tap **Mark** when the doors open at each station. The summary then reports how many marks fall in detected stops ("marks near detected stops"). A mark is near a stop when it is within 3 s of it. If you walk off the train as the doors open, that last mark will not count.
+On a calibration ride, tap **Station** when the doors open at each station. The summary then reports how many station marks fall in detected stops ("station marks near detected stops"). A mark is near a stop when it is within 3 s of it. If you walk off the train as the doors open, that last mark will not count.
 
 To see the evidence second by second:
 
@@ -85,7 +85,7 @@ To see the evidence second by second:
 go run ./cmd/recording-summarize -energy -- path/to/session.ndjson > energy.csv
 ```
 
-Each row is one second: the jolt, the smoothed jolt, the jolt relative to the ride's typical level (stops are well below 1), service (`1` a probe got through, `0` probes failed), and `mark=1` where you tapped Mark. The flags `-min-stop-s`, `-min-segment-s`, `-smooth-s`, and `-tunnel-gap-s` change the limits.
+Each row is one second: the jolt, the smoothed jolt, the jolt relative to the ride's typical level (stops are well below 1), service (`1` a probe got through, `0` probes failed), and `mark` (`station` or `anomaly`) where you tapped a mark button. The flags `-min-stop-s`, `-min-segment-s`, `-smooth-s`, and `-tunnel-gap-s` change the limits.
 
 ## Ride your recording
 

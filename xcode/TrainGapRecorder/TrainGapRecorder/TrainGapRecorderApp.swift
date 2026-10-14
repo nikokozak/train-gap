@@ -15,6 +15,11 @@ struct TrainGapRecorderApp: App {
                 .onAppear {
                     linesStore.loadBundledLinesJSON()
                     sessionsStore.refresh()
+                    // The lock screen buttons write marks through the same recorder.
+                    MarkIntent.handler = { [recorder] kind in await recorder.mark(kind) }
+                }
+                .task {
+                    await Recorder.endStaleActivities()
                 }
         }
     }
