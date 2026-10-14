@@ -47,3 +47,26 @@ func TestChooseRide(t *testing.T) {
 		t.Fatal("a line without rides gave no error")
 	}
 }
+
+// --udp takes PORT=HOST:PORT.
+func TestParseUDPRelay(t *testing.T) {
+	tests := []struct {
+		value   string
+		want    udpRelay
+		wantErr bool
+	}{
+		{"8053=1.1.1.1:53", udpRelay{8053, "1.1.1.1:53"}, false},
+		{"4433=example.com:443", udpRelay{4433, "example.com:443"}, false},
+		{"4433=[2606:4700::1111]:53", udpRelay{4433, "[2606:4700::1111]:53"}, false},
+		{"1.1.1.1:53", udpRelay{}, true},     // No local port.
+		{"8053=1.1.1.1", udpRelay{}, true},   // No destination port.
+		{"0=1.1.1.1:53", udpRelay{}, true},   // Port 0 would hide where to send.
+		{"dns=1.1.1.1:53", udpRelay{}, true}, // Not a number.
+	}
+	for _, test := range tests {
+		got, err := parseUDPRelay(test.value)
+		if (err != nil) != test.wantErr || got != test.want {
+			t.Errorf("parseUDPRelay(%q) = %+v, %v; want %+v, error %v", test.value, got, err, test.want, test.wantErr)
+		}
+	}
+}

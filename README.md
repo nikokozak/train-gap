@@ -44,13 +44,27 @@ train-gap --ride <name>                  # a ride from `train-gap rides`
 train-gap --ride session.ndjson          # your own recording from the iPhone recorder
 ```
 
-Flags for both modes: `--line`, `--ride`, `--speed` (0.1 to 10, 1 is real time), `--manual` (start paused), `--port`.
+**Relay UDP.** Clients send UDP straight to the destination, not through a proxy. `--udp PORT=HOST:PORT` opens a UDP port on localhost that relays to one destination through the ride. Point your client at that port:
+
+```bash
+train-gap --udp 8053=1.1.1.1:53
+dig @127.0.0.1 -p 8053 example.com                    # DNS
+
+train-gap --udp 4433=example.com:443
+curl --http3-only --connect-to example.com:443:127.0.0.1:4433 https://example.com
+```
+
+Use this for HTTP/3 (QUIC), games, voice, and your own UDP protocols: any client where you can set the server address. `--udp` can be given more than once. With `run`, give curl `--noproxy '*'`: curl does not send HTTP/3 through a proxy.
+
+Flags for both modes: `--line`, `--ride`, `--speed` (0.1 to 10, 1 is real time), `--manual` (start paused), `--port`, `--udp`.
 
 ## How it works
 
 A ride is a list of station stops and runs between stations, with one measurement for each second: either no service, or the delay that the proxy adds in each direction (half the round trip that the phone measured). Train-Gap plays the ride there and back, and then again. For the way back, it uses a recorded ride in the other direction between the same stations; if there is none, it plays the ride backward.
 
 Without service, nothing fails and nothing is dropped. Reads, writes, and new connections wait until service comes back, as TCP does in a tunnel. DNS lookups that the proxy does (for HTTP clients, and SOCKS5 clients that send host names) wait too. Your app's own timeouts decide what fails.
+
+UDP does not resend, so the relay drops each datagram that meets no service, as the phone would. With service, each datagram waits the delay once in each direction, in order.
 
 ## Rides
 
@@ -64,7 +78,8 @@ The rides are in [`rides/`](rides/), one small JSON file each. There are few so 
 ## Limits
 
 - Only lines and stations that someone recorded.
-- Only TCP. UDP, for example HTTP/3, does not go through the proxy.
+- UDP goes around Train-Gap unless you relay it with `--udp`, one destination per port. Without the relay, an app that uses UDP (HTTP/3, WebRTC calls, games) has full service in every tunnel. WebRTC chooses its peer addresses itself, so `--udp` cannot relay a call.
+- The rides have no packet loss for weak signal yet: in each second, a UDP datagram is either delayed or dropped.
 - Only clients that use a proxy. Go's HTTP client never proxies `localhost`, and most clients skip hosts in `NO_PROXY`.
 - The delay applies to each chunk of data that the proxy reads or writes, not to each packet.
 

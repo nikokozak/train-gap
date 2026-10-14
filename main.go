@@ -7,10 +7,12 @@ import (
 	"io"
 	"maps"
 	"math/rand/v2"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,7 +36,8 @@ Usage:
   train-gap run [flags] -- <command>   Run a command through the proxy while the ride plays.
   train-gap rides                      List the recorded rides.
 
-Without --ride, Train-Gap picks a random ride (on --line, if given).
+Without --ride, Train-Gap picks a random ride (on --line, if given). UDP does not go through
+the proxy; --udp relays one UDP destination through the ride.
 
 Flags:
 `
@@ -46,25 +49,71 @@ Examples:
   train-gap run --speed 4 -- npm test       # run your tests on a ride
   train-gap --ride session.ndjson           # your own recording from the iPhone recorder
   curl --proxy http://localhost:1080 https://example.com
+  train-gap --udp 8053=1.1.1.1:53           # then: dig @127.0.0.1 -p 8053 example.com
 `
 
 // rideOptions are the flags shared by both modes.
 type rideOptions struct {
-	lineID   *string
-	rideName *string
-	port     *int
-	speed    *float64
-	isPaused *bool
+	lineID    *string
+	rideName  *string
+	port      *int
+	speed     *float64
+	isPaused  *bool
+	udpRelays *[]udpRelay
+}
+
+// udpRelay is one --udp flag: datagrams to 127.0.0.1:port go to destination.
+type udpRelay struct {
+	port        int
+	destination string // host:port
 }
 
 func addRideFlags(flags *flag.FlagSet, defaultPort int) rideOptions {
-	return rideOptions{
-		lineID:   flags.String("line", "", "ride a random recording on this line"),
-		rideName: flags.String("ride", "", "a ride from `train-gap rides`, a ride file (.json), or an iPhone recording (.ndjson)"),
-		port:     flags.Int("port", defaultPort, "proxy port, SOCKS5 and HTTP (0 picks a free port)"),
-		speed:    flags.Float64("speed", 1.0, "simulation speed, 0.1 to 10 (1 is real time)"),
-		isPaused: flags.Bool("manual", false, "start paused; press n to step through stops and runs"),
+	options := rideOptions{
+		lineID:    flags.String("line", "", "ride a random recording on this line"),
+		rideName:  flags.String("ride", "", "a ride from `train-gap rides`, a ride file (.json), or an iPhone recording (.ndjson)"),
+		port:      flags.Int("port", defaultPort, "proxy port, SOCKS5 and HTTP (0 picks a free port)"),
+		speed:     flags.Float64("speed", 1.0, "simulation speed, 0.1 to 10 (1 is real time)"),
+		isPaused:  flags.Bool("manual", false, "start paused; press n to step through stops and runs"),
+		udpRelays: &[]udpRelay{},
 	}
+	flags.Func("udp", "relay UDP from 127.0.0.1:`PORT=HOST:PORT` to HOST:PORT through the ride (repeatable)", func(value string) error {
+		relay, err := parseUDPRelay(value)
+		if err != nil {
+			return err
+		}
+		*options.udpRelays = append(*options.udpRelays, relay)
+		return nil
+	})
+	return options
+}
+
+// parseUDPRelay reads "8053=1.1.1.1:53".
+func parseUDPRelay(value string) (udpRelay, error) {
+	portText, destination, hasEquals := strings.Cut(value, "=")
+	port, err := strconv.Atoi(portText)
+	if !hasEquals || err != nil || port < 1 || port > 65535 {
+		return udpRelay{}, fmt.Errorf("want PORT=HOST:PORT, for example 8053=1.1.1.1:53")
+	}
+	if _, _, err := net.SplitHostPort(destination); err != nil {
+		return udpRelay{}, fmt.Errorf("destination %q: %w", destination, err)
+	}
+	return udpRelay{port: port, destination: destination}, nil
+}
+
+// startProxy starts the proxy and the UDP relays for the ride.
+func (options rideOptions) startProxy(ride *sim.Ride) (*proxy.Server, error) {
+	proxyServer := proxy.NewServer(*options.port, ride.Condition)
+	if err := proxyServer.Start(); err != nil {
+		return nil, fmt.Errorf("starting proxy: %w", err)
+	}
+	for _, relay := range *options.udpRelays {
+		if _, err := proxyServer.RelayUDP(relay.port, relay.destination); err != nil {
+			_ = proxyServer.Stop() // The relay error is the one to report.
+			return nil, err
+		}
+	}
+	return proxyServer, nil
 }
 
 // chooseRide returns the ride to play: the one --ride names, or else a random shipped ride, on
@@ -172,9 +221,9 @@ func runTerminalUI() {
 		os.Exit(1)
 	}
 
-	proxyServer := proxy.NewServer(*options.port, ride.Condition)
-	if err := proxyServer.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error starting proxy: %v\n", err)
+	proxyServer, err := options.startProxy(ride)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
 	defer proxyServer.Stop()
@@ -214,9 +263,9 @@ func runCommand(arguments []string) int {
 		fmt.Fprintln(os.Stderr, "train-gap:", err)
 		return 2
 	}
-	proxyServer := proxy.NewServer(*options.port, ride.Condition)
-	if err := proxyServer.Start(); err != nil {
-		fmt.Fprintln(os.Stderr, "train-gap: starting proxy:", err)
+	proxyServer, err := options.startProxy(ride)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "train-gap:", err)
 		return 2
 	}
 	defer proxyServer.Stop()
@@ -233,6 +282,9 @@ func runCommand(arguments []string) int {
 	}
 
 	fmt.Fprintf(os.Stderr, "train-gap: riding %s; proxy %s\n", describeRide(chosen), proxyURL)
+	for _, relay := range *options.udpRelays {
+		fmt.Fprintf(os.Stderr, "train-gap: UDP 127.0.0.1:%d -> %s\n", relay.port, relay.destination)
+	}
 	stopLogging := make(chan struct{})
 	go logRide(ride, os.Stderr, stopLogging)
 	err = child.Run()

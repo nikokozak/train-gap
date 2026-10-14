@@ -44,6 +44,7 @@ type Server struct {
 	socksServer      *socks5.Server
 	httpServer       *http.Server
 	httpConnections  *connectionQueue // Accepted connections that start with an HTTP request.
+	udpRelays        []*udpRelay
 	stats            Stats
 	running          bool
 	mu               sync.Mutex
@@ -284,11 +285,15 @@ func (s *Server) RecentConnections() []Connection {
 	return connections
 }
 
-// Stop stops accepting connections.
+// Stop stops accepting connections and closes the UDP relays.
 func (s *Server) Stop() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	for _, relay := range s.udpRelays {
+		relay.close()
+	}
+	s.udpRelays = nil
 	if !s.running {
 		return nil
 	}
@@ -437,9 +442,10 @@ func sleepWithCancel(cancel <-chan struct{}, duration time.Duration) error {
 	}
 }
 
-// Connection is one connection to a destination, as the request log shows it.
+// Connection is one connection to a destination, as the request log shows it. A UDP flow (one
+// client's datagrams through a relay) is a connection too.
 type Connection struct {
-	Destination   string    // host:port, as the client asked for it.
+	Destination   string    // host:port, as the client asked for it; "udp host:port" for a UDP flow.
 	OpenedAt      time.Time // When the client asked for the connection.
 	IsConnected   bool      // The dial finished. False while it waits for service, or after it failed.
 	HasFailed     bool      // The dial failed, or the client gave up while it waited for service.
@@ -448,15 +454,18 @@ type Connection struct {
 	Stalled       time.Duration // Total time spent waiting for service, including now.
 	BytesSent     int64
 	BytesReceived int64
+	// UDP only: datagrams lost to no service or a full queue. UDP does not stall; it drops.
+	DroppedDatagrams int64
 }
 
 // connectionRecord is the live state behind a Connection. The byte counters change with every
 // read and write, so they are atomic; the other fields change rarely and use mu.
 type connectionRecord struct {
-	destination   string
-	openedAt      time.Time
-	bytesSent     atomic.Int64
-	bytesReceived atomic.Int64
+	destination      string
+	openedAt         time.Time
+	bytesSent        atomic.Int64
+	bytesReceived    atomic.Int64
+	droppedDatagrams atomic.Int64
 
 	mu           sync.Mutex
 	isConnected  bool
@@ -510,6 +519,8 @@ func (record *connectionRecord) snapshot(now time.Time) Connection {
 		Stalled:       record.stalled,
 		BytesSent:     record.bytesSent.Load(),
 		BytesReceived: record.bytesReceived.Load(),
+
+		DroppedDatagrams: record.droppedDatagrams.Load(),
 	}
 	if connection.IsWaiting {
 		connection.Stalled += now.Sub(record.waitingSince)

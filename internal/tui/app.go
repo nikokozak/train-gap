@@ -381,6 +381,9 @@ func logRow(connection proxy.Connection, width int) string {
 	if !connection.IsWaiting && connection.Stalled >= time.Second {
 		state += paint(colorDim, fmt.Sprintf(" · stalled %ds", int(connection.Stalled.Seconds())))
 	}
+	if connection.DroppedDatagrams > 0 { // UDP drops where TCP stalls.
+		state += paint(colorDim, fmt.Sprintf(" · dropped %d", connection.DroppedDatagrams))
+	}
 	const stateWidth = 21 // "closed · stalled 120s"
 	state += paint(colorText, strings.Repeat(" ", max(0, stateWidth-lipgloss.Width(state))))
 
