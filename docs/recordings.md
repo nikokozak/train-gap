@@ -87,27 +87,43 @@ go run ./cmd/recording-summarize -energy -- path/to/session.ndjson > energy.csv
 
 Each row is one second: the jolt, the smoothed jolt, the jolt relative to the ride's typical level (stops are well below 1), service (`1` a probe got through, `0` probes failed), and `mark=1` where you tapped Mark. The flags `-min-stop-s`, `-min-segment-s`, `-smooth-s`, and `-tunnel-gap-s` change the limits.
 
-## Replay a ride
+## Ride your recording
 
 ```bash
-train-gap --replay path/to/session.ndjson
-train-gap run --replay path/to/session.ndjson -- npm test
+train-gap --ride path/to/session.ndjson
+train-gap run --ride path/to/session.ndjson -- npm test
 ```
 
-The simulator finds the stops as above and then plays the ride as it was recorded. Each second gets the result of the probe that started in it:
+Train-Gap finds the stops as above and plays the ride as it was recorded. Each second gets the result of the probe that started in it:
 - A failed probe is a second without service. Connections stall through it.
 - A successful probe sets the added delay to half its round-trip time. A probe on a new connection includes TCP and TLS setup, so it counts as three round trips.
 
-After the end station, the ride starts again. Replay needs stops, so the stop detection status must be `matched`, `motion_only`, or `unverified_end`.
+The stop detection status must be `matched`, `motion_only`, or `unverified_end`.
+
+## Add your ride to Train-Gap
+
+Rides in [`rides/`](../rides/) ship with Train-Gap. To add yours:
+
+1) Export it:
+
+   ```bash
+   go run ./cmd/ride-export path/to/session.ndjson
+   ```
+
+   This writes `rides/<line>-<from>-to-<to>-<month>-<id>.json`. If stop detection was not `matched`, the tool says so; check the stops with `recording-summarize` first.
+2) Try it: `go run . --ride <name>`.
+3) Open a pull request with the new file. `go test ./rides` checks that it plays on its line.
+
+A ride file keeps the line, the stations, the stops and runs, the month, the carrier, and one value for each second: the delay in milliseconds, or `-1` for no service. It leaves out the day and time, the device, the session ID, the probe URLs, and the motion data. A route that you ride every day still shows roughly where you live or work; share only the rides that you are comfortable with.
 
 ## Station dataset
 
 One file, `internal/lines/lines.json`, serves both apps. The simulator embeds it; the Xcode project links to it (`xcode/TrainGapRecorder/TrainGapRecorder/lines.json` is a symlink). Station IDs are GTFS stop IDs, so recordings and the simulator use the same IDs.
 
-To rebuild it from the [MTA GTFS zip](https://new.mta.info/developers) and the [MTA Subway Stations CSV](https://data.ny.gov/d/39hk-dx4f):
+To rebuild it from the [MTA GTFS zip](https://new.mta.info/developers):
 
 ```bash
-go run ./cmd/lines-gtfs -in /path/to/google_transit.zip -stations /path/to/MTA_Subway_Stations.csv -replace-existing
+go run ./cmd/lines-gtfs -in /path/to/google_transit.zip -replace-existing
 ```
 
-With `-stations` alone, the tool only updates the existing file. A segment between two underground stations is a tunnel without service, unless the tool lists it as wired. The only wired tunnel listed is the L's Canarsie tunnel, which has service on AT&T, Verizon, and T-Mobile.
+Rides refer to stations by these IDs, and each run must join two neighbouring stations of the line. After a rebuild, `go test ./rides` checks that every ride still fits.

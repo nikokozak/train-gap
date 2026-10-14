@@ -13,14 +13,13 @@ const (
 	maximumSpeed = 10.0
 )
 
-// Ride plays a line's timeline in simulated time. Simulated time runs at speed times wall time
+// Ride plays a timeline on a line in simulated time. Simulated time runs at speed times wall time
 // and stops while paused. It is safe for concurrent use: proxy connections read the condition
-// while the TUI changes the speed.
+// while the TUI changes the speed or switches to another ride.
 type Ride struct {
-	Line     *lines.Line
-	Timeline Timeline
-
-	mu sync.Mutex
+	mu       sync.Mutex
+	line     *lines.Line
+	timeline Timeline
 	// Simulated time is anchorElapsed plus the wall time since anchorWall, times speed.
 	// Every change of speed, pause, or position moves the anchor to "now".
 	anchorWall    time.Time
@@ -32,9 +31,31 @@ type Ride struct {
 
 // NewRide starts playing the timeline from its first phase, at normal speed.
 func NewRide(line *lines.Line, timeline Timeline) *Ride {
-	ride := &Ride{Line: line, Timeline: timeline, speed: 1, now: time.Now}
+	ride := &Ride{line: line, timeline: timeline, speed: 1, now: time.Now}
 	ride.anchorWall = ride.now()
 	return ride
+}
+
+// Switch starts another timeline from its first phase. Speed and pause stay as they are.
+func (ride *Ride) Switch(line *lines.Line, timeline Timeline) {
+	ride.mu.Lock()
+	defer ride.mu.Unlock()
+	ride.line, ride.timeline = line, timeline
+	ride.anchorElapsed, ride.anchorWall = 0, ride.now()
+}
+
+// Line returns the line the ride is on.
+func (ride *Ride) Line() *lines.Line {
+	ride.mu.Lock()
+	defer ride.mu.Unlock()
+	return ride.line
+}
+
+// Timeline returns what the ride plays.
+func (ride *Ride) Timeline() Timeline {
+	ride.mu.Lock()
+	defer ride.mu.Unlock()
+	return ride.timeline
 }
 
 // elapsedLocked returns the simulated time. The caller holds mu.
@@ -60,8 +81,11 @@ func (ride *Ride) Elapsed() time.Duration {
 
 // Position returns the current phase, its index in the timeline, and the offset into it.
 func (ride *Ride) Position() (phase Phase, index int, offset time.Duration) {
-	index, offset = ride.Timeline.At(ride.Elapsed())
-	return ride.Timeline.Phases[index], index, offset
+	ride.mu.Lock()
+	timeline, elapsed := ride.timeline, ride.elapsedLocked()
+	ride.mu.Unlock()
+	index, offset = timeline.At(elapsed)
+	return timeline.Phases[index], index, offset
 }
 
 // Condition returns the network condition now.
@@ -105,7 +129,7 @@ func (ride *Ride) SkipToNextPhase() {
 	ride.mu.Lock()
 	defer ride.mu.Unlock()
 	elapsed := ride.elapsedLocked()
-	index, offset := ride.Timeline.At(elapsed)
-	ride.anchorElapsed = elapsed - offset + ride.Timeline.Phases[index].Duration
+	index, offset := ride.timeline.At(elapsed)
+	ride.anchorElapsed = elapsed - offset + ride.timeline.Phases[index].Duration
 	ride.anchorWall = ride.now()
 }

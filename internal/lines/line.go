@@ -1,31 +1,25 @@
-// Package lines holds the subway lines that the simulator rides. The data comes from MTA GTFS
-// and the MTA Subway Stations dataset (cmd/lines-gtfs); the iPhone recorder uses the same file.
+// Package lines holds the subway lines and their stations in ride order. The data comes from MTA
+// GTFS (cmd/lines-gtfs); the iPhone recorder uses the same file.
 package lines
 
-import "time"
+import "slices"
 
 // Line is one subway service with its stations in ride order.
 type Line struct {
-	ID       string
-	Name     string
-	Color    string
-	Stations []Station
-	Segments []Segment // Segments[i] runs from Stations[i] to Stations[i+1].
+	ID       string    `json:"id"`
+	Name     string    `json:"name"`
+	Color    string    `json:"color"`
+	Stations []Station `json:"stations"`
 }
 
 // Station is one stop on a line.
 type Station struct {
-	ID        string // GTFS stop ID, e.g. "L06". Recordings use the same IDs.
-	Name      string
-	ShortName string
-	Dwell     time.Duration // How long the train usually stands here.
-	Structure string        // "Subway" (underground), "Elevated", "At Grade", ...
+	ID        string `json:"id"` // GTFS stop ID, e.g. "L06". Recordings use the same IDs.
+	Name      string `json:"name"`
+	ShortName string `json:"short_name"`
 }
 
-// Segment is the track between two neighbouring stations.
-type Segment struct {
-	FromID     string
-	ToID       string
-	Duration   time.Duration // Scheduled running time from GTFS.
-	HasService bool          // False for a tunnel without cell coverage.
+// StationIndex returns the position of the station on the line, or -1.
+func (line *Line) StationIndex(stationID string) int {
+	return slices.IndexFunc(line.Stations, func(station Station) bool { return station.ID == stationID })
 }

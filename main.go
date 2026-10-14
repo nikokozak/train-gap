@@ -5,8 +5,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
+	"math/rand/v2"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -15,101 +20,140 @@ import (
 	"github.com/nikokozak/train-gap/internal/recording"
 	"github.com/nikokozak/train-gap/internal/sim"
 	"github.com/nikokozak/train-gap/internal/tui"
+	"github.com/nikokozak/train-gap/rides"
 )
 
-const usage = `Train-Gap: NYC Subway Network Simulator
+const usage = `Train-Gap: ride the NYC subway from your terminal
 
-A proxy (SOCKS5 and HTTP on one port) that rides an NYC subway line. Route your traffic
-through it to test how your app handles signal loss between stations, stalls, and slow recovery.
-Stations have service; tunnels without coverage stall connections until the next station.
+A proxy (SOCKS5 and HTTP on one port) that replays real subway rides: the cell service and
+delay measured in every second, there and back. Route your traffic through it to see how your
+app handles tunnels without service, stalls, and slow recovery.
 
 Usage:
   train-gap [flags]                    Show the ride in the terminal and run the proxy.
   train-gap run [flags] -- <command>   Run a command through the proxy while the ride plays.
+  train-gap rides                      List the recorded rides.
+
+Without --ride, Train-Gap picks a random ride (on --line, if given).
 
 Flags:
 `
 
 const examples = `
 Examples:
-  train-gap                                 # L train, proxy on port 1080
-  train-gap --line 3 --speed 4              # 3 train, four times real time
-  train-gap run --speed 4 -- npm test       # run your tests on the L train
-  train-gap --replay ride.ndjson            # replay a ride recorded with the iPhone recorder
+  train-gap                                 # a random ride; proxy on port 1080
+  train-gap --line 3 --speed 4              # a random 3-train ride, four times real time
+  train-gap run --speed 4 -- npm test       # run your tests on a ride
+  train-gap --ride session.ndjson           # your own recording from the iPhone recorder
   curl --proxy http://localhost:1080 https://example.com
-
-Lines: %v
 `
 
 // rideOptions are the flags shared by both modes.
 type rideOptions struct {
-	lineID     *string
-	replayPath *string
-	port       *int
-	speed      *float64
-	isPaused   *bool
+	lineID   *string
+	rideName *string
+	port     *int
+	speed    *float64
+	isPaused *bool
 }
 
 func addRideFlags(flags *flag.FlagSet, defaultPort int) rideOptions {
 	return rideOptions{
-		lineID:     flags.String("line", "L", "subway line to ride"),
-		replayPath: flags.String("replay", "", "replay a ride recorded with the iPhone recorder (.ndjson) instead of the line model"),
-		port:       flags.Int("port", defaultPort, "proxy port, SOCKS5 and HTTP (0 picks a free port)"),
-		speed:      flags.Float64("speed", 1.0, "simulation speed, 0.1 to 10 (1 is real time)"),
-		isPaused:   flags.Bool("manual", false, "start paused; press n to step through stops and runs"),
+		lineID:   flags.String("line", "", "ride a random recording on this line"),
+		rideName: flags.String("ride", "", "a ride from `train-gap rides`, a ride file (.json), or an iPhone recording (.ndjson)"),
+		port:     flags.Int("port", defaultPort, "proxy port, SOCKS5 and HTTP (0 picks a free port)"),
+		speed:    flags.Float64("speed", 1.0, "simulation speed, 0.1 to 10 (1 is real time)"),
+		isPaused: flags.Bool("manual", false, "start paused; press n to step through stops and runs"),
 	}
 }
 
-func (options rideOptions) newRide() (*sim.Ride, error) {
-	line, timeline, err := options.timeline()
+// chooseRide returns the ride to play: the one --ride names, or else a random shipped ride, on
+// --line if given.
+func (options rideOptions) chooseRide() (rides.Ride, error) {
+	name := *options.rideName
+	switch {
+	case strings.HasSuffix(name, ".ndjson"):
+		recorded, err := recording.Read(name)
+		if err != nil {
+			return rides.Ride{}, err
+		}
+		ride, _, err := recording.ToRide(recorded)
+		if err != nil {
+			return rides.Ride{}, fmt.Errorf("%s: %w", name, err)
+		}
+		ride.Name = strings.TrimSuffix(filepath.Base(name), ".ndjson")
+		return ride, nil
+	case strings.HasSuffix(name, ".json"):
+		data, err := os.ReadFile(name)
+		if err != nil {
+			return rides.Ride{}, err
+		}
+		return rides.Parse(strings.TrimSuffix(filepath.Base(name), ".json"), data)
+	case name != "":
+		ride, ok := rides.Get(name)
+		if !ok {
+			return rides.Ride{}, fmt.Errorf("no ride named %q; `train-gap rides` lists them", name)
+		}
+		return ride, nil
+	}
+
+	var candidates []rides.Ride
+	linesWithRides := map[string]bool{}
+	for _, ride := range rides.All() {
+		linesWithRides[ride.LineID] = true
+		if *options.lineID == "" || ride.LineID == *options.lineID {
+			candidates = append(candidates, ride)
+		}
+	}
+	if len(candidates) == 0 {
+		return rides.Ride{}, fmt.Errorf("no recorded rides on the %s yet (lines with rides: %v); docs/recordings.md says how to record one",
+			*options.lineID, slices.Sorted(maps.Keys(linesWithRides)))
+	}
+	return candidates[rand.IntN(len(candidates))], nil
+}
+
+// newRide chooses a ride and starts playing it there and back.
+func (options rideOptions) newRide() (*sim.Ride, rides.Ride, error) {
+	chosen, err := options.chooseRide()
 	if err != nil {
-		return nil, err
+		return nil, rides.Ride{}, err
+	}
+	line := lines.Get(chosen.LineID)
+	if line == nil {
+		return nil, rides.Ride{}, fmt.Errorf("ride %s: line %q is not in the station dataset", chosen.Name, chosen.LineID)
+	}
+	timeline, err := rides.RoundTrip(chosen, line)
+	if err != nil {
+		return nil, rides.Ride{}, err
 	}
 	ride := sim.NewRide(line, timeline)
 	ride.SetSpeed(*options.speed)
 	ride.SetPaused(*options.isPaused)
-	return ride, nil
+	return ride, chosen, nil
 }
 
-// timeline returns the line and what to play on it: the recording given by --replay, or else the
-// model of --line.
-func (options rideOptions) timeline() (*lines.Line, sim.Timeline, error) {
-	if *options.replayPath == "" {
-		line := lines.Get(*options.lineID)
-		if line == nil {
-			return nil, sim.Timeline{}, fmt.Errorf("unknown line %q; lines: %v", *options.lineID, lines.IDs())
-		}
-		return line, sim.NewTimeline(line), nil
-	}
-
-	recorded, err := recording.Read(*options.replayPath)
-	if err != nil {
-		return nil, sim.Timeline{}, err
-	}
-	line := lines.Get(recorded.Start.LineID)
-	if line == nil {
-		return nil, sim.Timeline{}, fmt.Errorf("%s: line %q is not in the station dataset", *options.replayPath, recorded.Start.LineID)
-	}
-	timeline, err := recording.Timeline(recorded, line)
-	if err != nil {
-		return nil, sim.Timeline{}, fmt.Errorf("%s: %w", *options.replayPath, err)
-	}
-	return line, timeline, nil
+// describeRide says what plays: "the 3, Nostrand Av → Hoyt St (recorded Oct 2026 · Verizon)".
+func describeRide(ride rides.Ride) string {
+	return fmt.Sprintf("the %s, %s (%s)", ride.LineID, ride.Route(lines.Get(ride.LineID)), ride.Source())
 }
 
-// describeRide says what plays: "riding the L train" or "replaying the 3 train ride of 2026-10-13 09:19".
-func describeRide(ride *sim.Ride) string {
-	if ride.Timeline.RecordedAt.IsZero() {
-		return fmt.Sprintf("riding the %s train", ride.Line.ID)
+// listRides prints the shipped rides, one per line.
+func listRides() {
+	for _, ride := range rides.All() {
+		minutes := int(ride.Duration().Round(time.Minute).Minutes())
+		fmt.Printf("%-44s  %-2s  %-36s  %2d min  %s\n", ride.Name, ride.LineID, ride.Route(lines.Get(ride.LineID)), minutes, ride.Source())
 	}
-	return fmt.Sprintf("replaying the %s train ride of %s", ride.Line.ID, ride.Timeline.RecordedAt.Local().Format("2006-01-02 15:04"))
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "run" {
+	switch {
+	case len(os.Args) > 1 && os.Args[1] == "run":
 		os.Exit(runCommand(os.Args[2:]))
+	case len(os.Args) > 1 && os.Args[1] == "rides":
+		listRides()
+	default:
+		runTerminalUI()
 	}
-	runTerminalUI()
 }
 
 // runTerminalUI shows the ride and runs the proxy until the user quits.
@@ -118,11 +162,11 @@ func runTerminalUI() {
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, usage)
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, examples, lines.IDs())
+		fmt.Fprint(os.Stderr, examples)
 	}
 	flag.Parse()
 
-	ride, err := options.newRide()
+	ride, chosen, err := options.newRide()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
@@ -135,7 +179,13 @@ func runTerminalUI() {
 	}
 	defer proxyServer.Stop()
 
-	program := tea.NewProgram(tui.NewModel(ride, proxyServer), tea.WithAltScreen())
+	// The ride list offers every shipped ride, and the chosen one if it came from a file.
+	choices := rides.All()
+	current := slices.IndexFunc(choices, func(ride rides.Ride) bool { return ride.Name == chosen.Name })
+	if current < 0 {
+		choices, current = append(choices, chosen), len(choices)
+	}
+	program := tea.NewProgram(tui.NewModel(ride, proxyServer, choices, current), tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running TUI: %v\n", err)
 		os.Exit(1)
@@ -159,7 +209,7 @@ func runCommand(arguments []string) int {
 		return 2
 	}
 
-	ride, err := options.newRide()
+	ride, chosen, err := options.newRide()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "train-gap:", err)
 		return 2
@@ -182,7 +232,7 @@ func runCommand(arguments []string) int {
 		child.Env = append(child.Env, name+"="+proxyURL)
 	}
 
-	fmt.Fprintf(os.Stderr, "train-gap: %s; proxy %s\n", describeRide(ride), proxyURL)
+	fmt.Fprintf(os.Stderr, "train-gap: riding %s; proxy %s\n", describeRide(chosen), proxyURL)
 	stopLogging := make(chan struct{})
 	go logRide(ride, os.Stderr, stopLogging)
 	err = child.Run()
@@ -212,7 +262,7 @@ func logRide(ride *sim.Ride, output io.Writer, stop <-chan struct{}) {
 		phase, phaseIndex, offset := ride.Position()
 		description := phase.ConditionAt(offset).Describe()
 		if phaseIndex != lastPhaseIndex || description != lastDescription {
-			fmt.Fprintf(output, "train-gap %s  %s: %s\n", formatElapsed(ride.Elapsed()), describePlace(ride.Line, phase), description)
+			fmt.Fprintf(output, "train-gap %s  %s: %s\n", formatElapsed(ride.Elapsed()), describePlace(ride.Line(), phase), description)
 			lastPhaseIndex, lastDescription = phaseIndex, description
 		}
 		select {

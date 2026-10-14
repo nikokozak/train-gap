@@ -7,7 +7,7 @@ import (
 
 // A ride with a clock the test moves by hand.
 func testRide() (*Ride, func(time.Duration)) {
-	ride := NewRide(testLine(), NewTimeline(testLine()))
+	ride := NewRide(testLine(), testTimeline())
 	wallTime := time.Unix(0, 0)
 	ride.now = func() time.Time { return wallTime }
 	ride.anchorWall = wallTime
@@ -71,5 +71,20 @@ func TestRideConditionFollowsTheTimeline(t *testing.T) {
 	advance(20*time.Second + 30*time.Second) // 30 s into the tunnel A->B.
 	if ride.Condition().IsConnected {
 		t.Fatal("in the tunnel: connected")
+	}
+}
+
+// Switch starts the new timeline from its start, at the same speed.
+func TestRideSwitch(t *testing.T) {
+	ride, advance := testRide()
+	ride.SetSpeed(2)
+	advance(30 * time.Second)
+	other := NewTimeline([]Phase{testPhase(AtStation, 2, 2, 5, testConnected)})
+	ride.Switch(testLine(), other)
+	if phase, index, offset := ride.Position(); index != 0 || offset != 0 || phase.FromIndex != 2 {
+		t.Fatalf("after Switch: phase %d at %v, %+v; want the new timeline's first phase from its start", index, offset, phase)
+	}
+	if ride.Speed() != 2 {
+		t.Fatalf("after Switch: Speed() = %v; want 2", ride.Speed())
 	}
 }

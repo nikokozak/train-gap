@@ -28,25 +28,12 @@ type outLine struct {
 	DirectionForwardLabel  string       `json:"direction_forward_label"`
 	DirectionBackwardLabel string       `json:"direction_backward_label"`
 	Stations               []outStation `json:"stations"`
-	Segments               []outSegment `json:"segments"`
 }
 
 type outStation struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
 	ShortName string `json:"short_name"`
-	DwellMS   int64  `json:"dwell_ms"`
-	// From the MTA Subway Stations dataset: "Subway" (underground), "Elevated", "At Grade",
-	// "Open Cut", "Embankment", or "Viaduct". Empty when the station is not in that dataset.
-	Structure string `json:"structure,omitempty"`
-}
-
-type outSegment struct {
-	FromID     string `json:"from_id"`
-	ToID       string `json:"to_id"`
-	DurationMS int64  `json:"duration_ms"`
-	// False for a tunnel between two underground stations without cell coverage.
-	HasService bool `json:"has_service"`
 }
 
 type routeInfo struct {
@@ -99,11 +86,9 @@ func main() {
 	var weekdayOnly bool
 	var timeStartHHMM string
 	var timeEndHHMM string
-	var stationsPath string
 
-	flag.StringVar(&inPath, "in", "", "path to MTA GTFS zip (e.g. google_transit.zip); without it, only the existing file is annotated")
+	flag.StringVar(&inPath, "in", "", "path to MTA GTFS zip (e.g. google_transit.zip)")
 	flag.StringVar(&outPath, "out", "internal/lines/lines.json", "output lines.json path (the Xcode project links to this file)")
-	flag.StringVar(&stationsPath, "stations", "", "path to the MTA Subway Stations CSV (https://data.ny.gov/d/39hk-dx4f), for station structure and tunnel service")
 	flag.StringVar(&routesCSV, "routes", defaultRoutesCSV(), "comma-separated route short names to include (e.g. A,C,F,3,4,5)")
 	flag.BoolVar(&listRoutes, "list-routes", false, "list available GTFS routes and exit")
 	flag.BoolVar(&replaceExisting, "replace-existing", false, "replace an existing line with the GTFS-generated one (default: keep existing)")
@@ -112,15 +97,10 @@ func main() {
 	flag.StringVar(&timeEndHHMM, "time-end", "16:00", "only consider trips starting before this local time (HH:MM)")
 	flag.Parse()
 
-	if inPath == "" && stationsPath == "" {
-		fatal(errors.New("give -in (GTFS zip), -stations (MTA Subway Stations CSV), or both"))
+	if inPath == "" {
+		fatal(errors.New("give -in (GTFS zip)"))
 	}
-
-	generatedByID := map[string]outLine{}
-	var warnings []string
-	if inPath != "" {
-		generatedByID, warnings = generateLines(inPath, routesCSV, listRoutes, weekdayOnly, timeStartHHMM, timeEndHHMM)
-	}
+	generatedByID, warnings := generateLines(inPath, routesCSV, listRoutes, weekdayOnly, timeStartHHMM, timeEndHHMM)
 
 	var out outBundle
 	out.GeneratedAt = time.Now().UTC().Format(time.RFC3339)
@@ -158,14 +138,6 @@ func main() {
 		case hasExisting:
 			out.Lines = append(out.Lines, existing)
 		}
-	}
-
-	if stationsPath != "" {
-		structureByStopID, err := readStationStructures(stationsPath)
-		if err != nil {
-			fatal(err)
-		}
-		warnings = append(warnings, annotateStructureAndService(out.Lines, structureByStopID)...)
 	}
 
 	for _, w := range uniqueSorted(warnings) {
@@ -295,29 +267,11 @@ func defaultRoutesCSV() string {
 
 func buildLine(route routeInfo, bt bestTrip) outLine {
 	stations := make([]outStation, 0, len(bt.Stations))
-	for i, st := range bt.Stations {
-		dwell := int64(25_000)
-		if i == 0 || i == len(bt.Stations)-1 {
-			dwell = 35_000
-		}
+	for _, st := range bt.Stations {
 		stations = append(stations, outStation{
 			ID:        st.StationID,
 			Name:      st.StationName,
 			ShortName: st.ShortName,
-			DwellMS:   dwell,
-		})
-	}
-
-	segments := make([]outSegment, 0, max(0, len(bt.Stations)-1))
-	for i := 0; i < len(bt.Stations)-1; i++ {
-		from := bt.Stations[i]
-		to := bt.Stations[i+1]
-		dur := inferSegmentDurationMS(from, to)
-		segments = append(segments, outSegment{
-			FromID:     from.StationID,
-			ToID:       to.StationID,
-			DurationMS: dur,
-			HasService: true, // -stations sets false for tunnels without coverage.
 		})
 	}
 
@@ -331,23 +285,7 @@ func buildLine(route routeInfo, bt bestTrip) outLine {
 		DirectionForwardLabel:  forward,
 		DirectionBackwardLabel: backward,
 		Stations:               stations,
-		Segments:               segments,
 	}
-}
-
-func inferSegmentDurationMS(from, to stationStop) int64 {
-	const fallback = int64(60_000)
-	const minDur = int64(10_000)
-	const maxDur = int64(10 * 60 * 1_000)
-
-	if from.DepartSec == nil || to.ArrivalSec == nil {
-		return fallback
-	}
-	delta := int64((*to.ArrivalSec - *from.DepartSec) * 1000)
-	if delta < minDur || delta > maxDur {
-		return fallback
-	}
-	return delta
 }
 
 func normalizeHexColor(s string, fallbackKey string) string {
@@ -1233,71 +1171,4 @@ func max(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// wiredTunnels lists tunnels between two underground stations that have cell service for
-// AT&T, Verizon, and T-Mobile. Keys are GTFS stop IDs in either order.
-// Canarsie tunnel (L, 1 Av - Bedford Av): MTA press releases, 2020-21.
-// Other wired tunnels (Joralemon St, 42 St Shuttle, parts of the G) were announced for AT&T
-// only, so they stay without service here until recordings show otherwise.
-var wiredTunnels = map[[2]string]bool{
-	{"L06", "L08"}: true,
-}
-
-// readStationStructures reads the MTA Subway Stations CSV and returns each GTFS stop ID's
-// structure ("Subway", "Elevated", ...).
-func readStationStructures(path string) (map[string]string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open stations CSV: %w", err)
-	}
-	defer file.Close()
-
-	reader := csv.NewReader(file)
-	header, err := readHeader(reader)
-	if err != nil {
-		return nil, fmt.Errorf("stations CSV: %w", err)
-	}
-	stopIDColumn := mustIndex(header, "GTFS Stop ID")
-	structureColumn := mustIndex(header, "Structure")
-
-	structureByStopID := map[string]string{}
-	for {
-		row, err := reader.Read()
-		if errors.Is(err, io.EOF) {
-			return structureByStopID, nil
-		}
-		if err != nil {
-			return nil, fmt.Errorf("stations CSV: %w", err)
-		}
-		structureByStopID[field(row, stopIDColumn)] = field(row, structureColumn)
-	}
-}
-
-// annotateStructureAndService sets each station's structure and marks a segment without
-// service when both of its stations are underground ("Subway") and the tunnel is not wired.
-// Recorded rides on the 3 train (2026-10) showed no service in any such tunnel.
-// It returns a warning for each station that is not in the CSV.
-func annotateStructureAndService(lines []outLine, structureByStopID map[string]string) []string {
-	var warnings []string
-	for lineIndex := range lines {
-		line := &lines[lineIndex]
-		structureByStationID := map[string]string{}
-		for stationIndex := range line.Stations {
-			station := &line.Stations[stationIndex]
-			structure, found := structureByStopID[station.ID]
-			if !found {
-				warnings = append(warnings, fmt.Sprintf("line %s: station %s (%s) is not in the stations CSV", line.ID, station.ID, station.Name))
-			}
-			station.Structure = structure
-			structureByStationID[station.ID] = structure
-		}
-		for segmentIndex := range line.Segments {
-			segment := &line.Segments[segmentIndex]
-			isUnderground := structureByStationID[segment.FromID] == "Subway" && structureByStationID[segment.ToID] == "Subway"
-			isWired := wiredTunnels[[2]string{segment.FromID, segment.ToID}] || wiredTunnels[[2]string{segment.ToID, segment.FromID}]
-			segment.HasService = !isUnderground || isWired
-		}
-	}
-	return warnings
 }

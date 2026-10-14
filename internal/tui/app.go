@@ -12,6 +12,7 @@ import (
 	"github.com/nikokozak/train-gap/internal/lines"
 	"github.com/nikokozak/train-gap/internal/proxy"
 	"github.com/nikokozak/train-gap/internal/sim"
+	"github.com/nikokozak/train-gap/rides"
 )
 
 const (
@@ -34,19 +35,25 @@ const (
 type tickMsg time.Time
 
 // Model draws a ride. The ride runs on its own clock and the proxy keeps its own log; the model
-// only reads them and passes keys on.
+// only reads them, passes keys on, and switches rides from the ride list.
 type Model struct {
 	ride        *sim.Ride
-	line        *lines.Line
+	line        *lines.Line // The ride's line; changes only when the model switches rides.
 	proxyServer *proxy.Server
+	choices     []rides.Ride // The ride list.
+	current     int          // Index into choices of the ride that plays.
+	isChoosing  bool         // The ride list is open.
+	cursor      int          // Index into choices of the highlighted ride.
 	width       int
 	height      int
 	quitting    bool
 }
 
-// NewModel shows the ride and the proxy that applies it.
-func NewModel(ride *sim.Ride, proxyServer *proxy.Server) Model {
-	return Model{ride: ride, line: ride.Line, proxyServer: proxyServer, width: 80, height: 24}
+// NewModel shows the ride, the proxy that applies it, and a list of rides to switch to.
+// choices[current] is the ride that plays.
+func NewModel(ride *sim.Ride, proxyServer *proxy.Server, choices []rides.Ride, current int) Model {
+	return Model{ride: ride, line: ride.Line(), proxyServer: proxyServer, choices: choices, current: current,
+		cursor: current, width: 80, height: 24}
 }
 
 func (m Model) Init() tea.Cmd {
@@ -60,10 +67,15 @@ func tick() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.isChoosing {
+			return m.updateRideList(msg)
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
 			m.quitting = true
 			return m, tea.Quit
+		case "tab":
+			m.isChoosing, m.cursor = true, m.current
 		case " ":
 			m.ride.SetPaused(!m.ride.IsPaused())
 		case "right", "l":
@@ -83,6 +95,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateRideList moves through the ride list and switches to the chosen ride.
+func (m Model) updateRideList(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key.String() {
+	case "q", "ctrl+c":
+		m.quitting = true
+		return m, tea.Quit
+	case "up", "k":
+		m.cursor = max(0, m.cursor-1)
+	case "down", "j":
+		m.cursor = min(len(m.choices)-1, m.cursor+1)
+	case "esc", "tab":
+		m.isChoosing = false
+	case "enter":
+		chosen := m.choices[m.cursor]
+		line := lines.Get(chosen.LineID)
+		// TestEmbeddedRides checks every shipped ride, and main checked a ride from a file, so an
+		// error here would be a bug; the ride that plays then stays.
+		if timeline, err := rides.RoundTrip(chosen, line); err == nil {
+			m.ride.Switch(line, timeline)
+			m.line, m.current = line, m.cursor
+		}
+		m.isChoosing = false
+	}
+	return m, nil
+}
+
 // View fits the panel to the terminal. Space goes first to the strip map, the condition, and the
 // controls; the connection log gets what is left; blank separators go first when space is short.
 func (m Model) View() string {
@@ -97,13 +135,19 @@ func (m Model) View() string {
 	}
 
 	sections := [][]string{m.viewHeader(width), m.viewTrack(width), m.viewCondition(width), m.viewFooter(width)}
+	if m.isChoosing {
+		// The list takes the place of the strip map, the condition, and the log.
+		const headerAndFooterRows, separatorRows = 3, 2
+		list := m.viewRideList(width, availableRows-headerAndFooterRows-separatorRows)
+		sections = [][]string{sections[0], list, sections[len(sections)-1]}
+	}
 	isSpacious := availableRows >= rowsWithoutLog+len(sections)-1
 	separatorRows := 0
 	if isSpacious {
 		separatorRows = len(sections) - 1
 	}
 	// The log needs its own separator, a title row, and at least one connection row.
-	if logRows := min(maxLogRows, availableRows-rowsWithoutLog-separatorRows-2); isSpacious && logRows >= 1 {
+	if logRows := min(maxLogRows, availableRows-rowsWithoutLog-separatorRows-2); isSpacious && logRows >= 1 && !m.isChoosing {
 		footer := sections[len(sections)-1]
 		sections = append(sections[:len(sections)-1], m.viewLog(width, logRows), footer)
 	}
@@ -145,10 +189,22 @@ func (m Model) viewHeader(width int) []string {
 	return []string{spread(left, paintBold(colorDim, "TRAIN-GAP"), width)}
 }
 
-// viewTrack draws the strip map: a few stations around the train, the track between them
-// (dotted through a tunnel without service), and the train moving along it.
+// viewTrack draws the strip map: a few stations around the train, the track between them, and
+// the train moving along it. Track the ride recorded is solid where every second had service and
+// dotted where some had none; track it did not record is faint.
 func (m Model) viewTrack(width int) []string {
 	phase, _, offset := m.ride.Position()
+	segmentHasService := map[int]bool{} // Segment k joins stations k and k+1. Absent: not recorded.
+	isOnRide := map[int]bool{}
+	for _, ridePhase := range m.ride.Timeline().Phases {
+		isOnRide[ridePhase.FromIndex], isOnRide[ridePhase.ToIndex] = true, true
+		if ridePhase.Kind == sim.Running {
+			segment := min(ridePhase.FromIndex, ridePhase.ToIndex)
+			hasService, isKnown := segmentHasService[segment]
+			segmentHasService[segment] = ridePhase.HasService && (hasService || !isKnown)
+		}
+	}
+
 	stations := m.line.Stations
 	stationCount := min(visibleStations, len(stations), width/minStationColumns)
 	firstIndex := min(max(0, phase.FromIndex-stationCount/2), len(stations)-stationCount)
@@ -180,12 +236,20 @@ func (m Model) viewTrack(width int) []string {
 		switch {
 		case fromFirstCenter < 0 || position > lastCenter:
 			track.WriteString(paint(colorText, " ")) // Before the first or after the last station.
-		case fromFirstCenter%columnWidth == 0:
+		case fromFirstCenter%columnWidth == 0 && isOnRide[firstIndex+fromFirstCenter/columnWidth]:
 			track.WriteString(paint(color, "●"))
-		case m.line.Segments[firstIndex+fromFirstCenter/columnWidth].HasService:
-			track.WriteString(paint(color, "━"))
+		case fromFirstCenter%columnWidth == 0:
+			track.WriteString(paint(colorFaint, "●"))
 		default:
-			track.WriteString(paint(colorDim, "┄"))
+			hasService, isRecorded := segmentHasService[firstIndex+fromFirstCenter/columnWidth]
+			switch {
+			case !isRecorded:
+				track.WriteString(paint(colorFaint, "─"))
+			case hasService:
+				track.WriteString(paint(color, "━"))
+			default:
+				track.WriteString(paint(colorDim, "┄"))
+			}
 		}
 	}
 
@@ -242,12 +306,13 @@ func (m Model) viewCondition(width int) []string {
 		timing = fmt.Sprintf("arrives in %ds", int(timeLeft.Seconds()))
 	}
 
-	from := m.line.Stations[phase.FromIndex].ShortName
-	place := paint(colorDim, "At ") + paint(colorText, from)
+	place := "At " + m.line.Stations[phase.FromIndex].ShortName
 	if phase.Kind == sim.Running {
-		place = paint(colorText, from) + paint(colorDim, " → ") + paint(colorText, m.line.Stations[phase.ToIndex].ShortName)
+		place = m.line.Stations[phase.FromIndex].ShortName + " → " + m.line.Stations[phase.ToIndex].ShortName
 	}
-	return []string{spread(status, paint(colorText, timing), width), place}
+	// A long station name gives way to the source, which says where the numbers come from.
+	place = truncateText(place, width-len([]rune(phase.Source))-2)
+	return []string{spread(status, paint(colorText, timing), width), spread(paint(colorText, place), paint(colorDim, phase.Source), width)}
 }
 
 // signalBars is the number of bars a phone would show: none without service, one for a weak
@@ -330,6 +395,32 @@ func logRow(connection proxy.Connection, width int) string {
 	return spread(opened+destination, received+state, width)
 }
 
+// viewRideList lists the rides, a window of them around the cursor, in rowCount rows.
+func (m Model) viewRideList(width, rowCount int) []string {
+	hint := paintBold(colorBright, "↑↓") + paint(colorDim, " choose  ") + paintBold(colorBright, "enter") +
+		paint(colorDim, " ride  ") + paintBold(colorBright, "esc") + paint(colorDim, " back")
+	rows := []string{spread(paintBold(colorDim, "RIDES"), hint, width)}
+
+	visibleCount := max(1, rowCount-1)
+	first := min(max(0, m.cursor-visibleCount/2), max(0, len(m.choices)-visibleCount))
+	for index := first; index < min(len(m.choices), first+visibleCount); index++ {
+		ride := m.choices[index]
+		marker, nameColor := paint(colorText, "  "), colorText
+		if index == m.cursor {
+			marker, nameColor = paintBold(colorBright, "▸ "), colorBright
+		}
+		minutes := int(ride.Duration().Round(time.Minute).Minutes())
+		left := marker + badge(ride.LineID) + paint(colorText, " ") + paint(nameColor, ride.Route(lines.Get(ride.LineID)))
+		right := paint(colorDim, fmt.Sprintf("%d min · %s", minutes, ride.Source()))
+		rows = append(rows, spread(left, right, width))
+	}
+	// Empty rows keep the panel's height while the list is open.
+	for len(rows) < rowCount {
+		rows = append(rows, "")
+	}
+	return rows
+}
+
 // formatBytes shows a byte count in B, KB, or MB.
 func formatBytes(byteCount int64) string {
 	switch {
@@ -347,9 +438,6 @@ func (m Model) viewFooter(width int) []string {
 	address := paint(colorDim, "proxy ") + paint(colorText, fmt.Sprintf("http://localhost:%d", m.proxyServer.Port()))
 
 	var modes []string
-	if recordedAt := m.ride.Timeline.RecordedAt; !recordedAt.IsZero() {
-		modes = append(modes, paint(colorText, "replay of "+recordedAt.Local().Format("Jan 2 15:04")))
-	}
 	if m.ride.IsPaused() {
 		modes = append(modes, paintBold(colorWeak, "PAUSED"))
 	}
@@ -357,7 +445,7 @@ func (m Model) viewFooter(width int) []string {
 	mode := strings.Join(modes, paint(colorDim, " · "))
 
 	var keys []string
-	for _, key := range [][2]string{{"spc", "pause"}, {"n", "next"}, {"←→", "speed"}, {"r", "1×"}, {"q", "quit"}} {
+	for _, key := range [][2]string{{"tab", "rides"}, {"spc", "pause"}, {"n", "next"}, {"←→", "speed"}, {"r", "1×"}, {"q", "quit"}} {
 		keys = append(keys, paintBold(colorBright, key[0])+paint(colorDim, " "+key[1]))
 	}
 	help := strings.Join(keys, paint(colorText, "  "))

@@ -1,5 +1,5 @@
 // Package recording reads rides recorded with the iPhone recorder (schemas/recording.v1.schema.json),
-// finds their stops, and turns them into timelines the simulator can replay.
+// finds their stops, and turns them into ride files (package rides).
 package recording
 
 import (
@@ -21,6 +21,7 @@ type SessionStart struct {
 	ToStationName             string   `json:"to_station_name"`
 	Direction                 string   `json:"direction"`
 	DirectionLabel            string   `json:"direction_label"`
+	Carrier                   string   `json:"carrier"` // Chosen by the rider: AT&T, Verizon, T-Mobile, or Other.
 	ProbeURL                  string   `json:"probe_url"`
 	ProbeURLs                 []string `json:"probe_urls"`
 	SampleIntervalInTransitMS *int     `json:"sample_interval_in_transit_ms"`
