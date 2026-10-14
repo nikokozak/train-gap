@@ -7,6 +7,7 @@ enum RecorderEventType: String, Codable {
     case sessionStart = "session_start"
     case sample = "sample"
     case motion = "motion"
+    case udpProbe = "udp_probe"
     case mark = "mark"
     case sessionEnd = "session_end"
 }
@@ -31,6 +32,8 @@ struct RecorderSessionStart: Codable {
     var sampleIntervalMS: Int?
     var carrier: String?
     var motionHz: Int?
+    /// The STUN server that `udp_probe` events measure ("host:port").
+    var udpProbeServer: String?
     /// Stations in ride order, from the start station to the terminal. Stop labels come from it,
     /// so a recording can be processed without the app's station dataset.
     var routeStations: [RouteStation]?
@@ -57,6 +60,7 @@ struct RecorderSessionStart: Codable {
         case sampleIntervalMS = "sample_interval_ms"
         case carrier
         case motionHz = "motion_hz"
+        case udpProbeServer = "udp_probe_server"
         case routeStations = "route_stations"
         case linesDataset = "lines_dataset"
         case device
@@ -156,6 +160,22 @@ struct RecorderMotion: Codable {
         case yMilliG = "y_mg"
         case zMilliG = "z_mg"
         case gravityMilliG = "gravity_mg"
+    }
+}
+
+/// One tick of STUN requests (StunProber), sent `intervalMS` apart from `tMS`. Each entry is a
+/// round trip in milliseconds, or nil (JSON null) when no reply came in time.
+struct RecorderUDPProbe: Codable {
+    var type: RecorderEventType = .udpProbe
+    var tMS: Int
+    var intervalMS: Int
+    var rttMS: [Int?]
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case tMS = "t_ms"
+        case intervalMS = "interval_ms"
+        case rttMS = "rtt_ms"
     }
 }
 

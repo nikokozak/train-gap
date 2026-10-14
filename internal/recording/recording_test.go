@@ -32,7 +32,7 @@ func writeRecording(t *testing.T, events []any, rawLines ...string) string {
 func TestReadNewRecorderEvents(t *testing.T) {
 	events := []any{map[string]any{
 		"type": "session_start", "v": 1, "session_id": "test", "started_at": "2026-10-03T12:00:00.250Z",
-		"line_id": "X", "from_station_id": "A", "direction": "forward",
+		"line_id": "X", "from_station_id": "A", "direction": "forward", "udp_probe_server": "stun.example.com:3478",
 		"route_stations": []map[string]string{{"id": "A", "name": "Alpha"}, {"id": "B", "name": "Bravo"}, {"id": "C", "name": "Charlie"}},
 	}}
 	batches, samples := syntheticRide(stationTunnelStation(phase{15, quietJolt, true}, phase{40, runningJolt, false})...)
@@ -48,6 +48,7 @@ func TestReadNewRecorderEvents(t *testing.T) {
 	}
 	events = append(events,
 		map[string]any{"type": "mark", "t_ms": 85_000},
+		map[string]any{"type": "udp_probe", "t_ms": 1_000, "interval_ms": 200, "rtt_ms": []any{31, nil, 40}},
 		map[string]any{"type": "session_end", "t_ms": 175_000, "ended_at": "2026-10-03T12:03:00Z", "end_station_id": "C", "end_station_name": "Charlie"},
 	)
 	path := writeRecording(t, events, `{"type":"sample","t_ms":176000,"pro`) // Cut off by a crash.
@@ -61,6 +62,12 @@ func TestReadNewRecorderEvents(t *testing.T) {
 	}
 	if reused := recording.Samples[0].Probe.ReusedConnection; reused == nil || !*reused {
 		t.Fatalf("reused_connection not read")
+	}
+	if recording.Start.UDPProbeServer != "stun.example.com:3478" || len(recording.UDPProbes) != 1 {
+		t.Fatalf("udp_probe_server %q, %d udp_probe events; want stun.example.com:3478, 1", recording.Start.UDPProbeServer, len(recording.UDPProbes))
+	}
+	if probe := recording.UDPProbes[0]; probe.IntervalMS != 200 || len(probe.RTTMS) != 3 || *probe.RTTMS[0] != 31 || probe.RTTMS[1] != nil {
+		t.Fatalf("udp_probe = %+v; want interval 200 and round trips [31, lost, 40]", probe)
 	}
 	if recording.EndMS() != 175_000 {
 		t.Fatalf("EndMS() = %d; want 175000", recording.EndMS())

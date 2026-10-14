@@ -29,6 +29,8 @@ type SessionStart struct {
 	// RouteStations lists the stations in ride order, starting at the start station.
 	// Recorder builds from 2026-10 write it; stop labels come from it.
 	RouteStations []RouteStation `json:"route_stations"`
+	// The STUN server for udp_probe events (host:port). Empty in recordings without them.
+	UDPProbeServer string `json:"udp_probe_server"`
 }
 
 // RouteStation is one station of the route, by GTFS stop ID.
@@ -62,6 +64,15 @@ type MotionBatch struct {
 	XMilliG []int `json:"x_mg"`
 	YMilliG []int `json:"y_mg"`
 	ZMilliG []int `json:"z_mg"`
+}
+
+// UDPProbe is one `udp_probe` event: STUN requests sent IntervalMS apart from TMS, one per
+// entry of RTTMS. An entry is the round trip in milliseconds, or nil when no reply came in time.
+// Recorder builds from 2026-10-14 write them.
+type UDPProbe struct {
+	TMS        int64    `json:"t_ms"`
+	IntervalMS int64    `json:"interval_ms"`
+	RTTMS      []*int64 `json:"rtt_ms"`
 }
 
 // Mark is a `mark` event: the rider tapped a mark button (optional).
@@ -106,6 +117,7 @@ type Recording struct {
 	Start         SessionStart
 	Samples       []Sample
 	Motion        []MotionBatch
+	UDPProbes     []UDPProbe
 	Marks         []Mark
 	End           SessionEnd
 	LegacyMarkers []LegacyMarker // Undo events are already applied.
@@ -162,6 +174,9 @@ func Read(path string) (Recording, error) {
 		case "motion":
 			recording.Motion = append(recording.Motion, MotionBatch{})
 			target = &recording.Motion[len(recording.Motion)-1]
+		case "udp_probe":
+			recording.UDPProbes = append(recording.UDPProbes, UDPProbe{})
+			target = &recording.UDPProbes[len(recording.UDPProbes)-1]
 		case "mark":
 			recording.Marks = append(recording.Marks, Mark{})
 			target = &recording.Marks[len(recording.Marks)-1]

@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"os"
+	"slices"
 	"sort"
 
 	"github.com/nikokozak/train-gap/internal/recording"
@@ -47,6 +49,9 @@ type summary struct {
 	// Set for recordings without station markers: how the segments were found from motion.
 	StopDetection *stopDetection `json:"stop_detection,omitempty"`
 	Stops         []stopSummary  `json:"stops,omitempty"`
+	// STUN requests (udp_probe events). Recorder builds from 2026-10-14 send them.
+	UDPProbeServer string `json:"udp_probe_server,omitempty"`
+	udpStats
 }
 
 type stopDetection struct {
@@ -75,6 +80,48 @@ type probeStats struct {
 	RTTMaxMS *int64 `json:"rtt_max_ms,omitempty"`
 }
 
+// udpStats summarizes the STUN requests (udp_probe events) sent inside a time window. A request
+// without a reply is lost. Round trips count answered requests only.
+type udpStats struct {
+	UDPRequests int    `json:"udp_requests,omitempty"`
+	UDPReplies  int    `json:"udp_replies,omitempty"`
+	UDPRTTP50MS *int64 `json:"udp_rtt_p50_ms,omitempty"`
+	UDPRTTP95MS *int64 `json:"udp_rtt_p95_ms,omitempty"`
+}
+
+// udpStatsBetween summarizes the STUN requests sent in [startMS, endMS).
+func udpStatsBetween(probes []recording.UDPProbe, startMS, endMS int64) udpStats {
+	var stats udpStats
+	var roundTrips []int64
+	for _, probe := range probes {
+		for index, roundTripMS := range probe.RTTMS {
+			sentMS := probe.TMS + int64(index)*probe.IntervalMS
+			if sentMS < startMS || sentMS >= endMS {
+				continue
+			}
+			stats.UDPRequests++
+			if roundTripMS != nil {
+				stats.UDPReplies++
+				roundTrips = append(roundTrips, *roundTripMS)
+			}
+		}
+	}
+	if len(roundTrips) > 0 {
+		slices.Sort(roundTrips)
+		median, ninetyFifth := percentile(roundTrips, 0.50), percentile(roundTrips, 0.95)
+		stats.UDPRTTP50MS, stats.UDPRTTP95MS = &median, &ninetyFifth
+	}
+	return stats
+}
+
+// udpLossText is ", udp lost 12%" for a window with STUN requests, and "" without.
+func udpLossText(stats udpStats) string {
+	if stats.UDPRequests == 0 {
+		return ""
+	}
+	return fmt.Sprintf(", udp lost %.0f%%", pct(stats.UDPRequests-stats.UDPReplies, stats.UDPRequests))
+}
+
 type segmentSummary struct {
 	FromStationID   string `json:"from_station_id"`
 	FromStationName string `json:"from_station_name"`
@@ -84,6 +131,7 @@ type segmentSummary struct {
 	ArriveTMS       int64  `json:"arrive_t_ms"`
 	DurationMS      int64  `json:"duration_ms"`
 	probeStats
+	udpStats
 }
 
 // stopSummary is the time the train stood still between two segments (or before the first
@@ -95,6 +143,7 @@ type stopSummary struct {
 	EndTMS      int64  `json:"end_t_ms"`
 	DurationMS  int64  `json:"duration_ms"`
 	probeStats
+	udpStats
 }
 
 func main() {
@@ -171,6 +220,8 @@ func summarizeFile(path string, settings recording.Settings) (summary, error) {
 		ProbeURLs:               start.ProbeURLs,
 		SampleIntervalInTransit: start.SampleIntervalInTransitMS,
 		SampleIntervalAtStation: start.SampleIntervalAtStationMS,
+		UDPProbeServer:          start.UDPProbeServer,
+		udpStats:                udpStatsBetween(ride.UDPProbes, 0, math.MaxInt64),
 		DamagedLines:            ride.DamagedLines,
 		InterfaceCounts:         map[string]int{},
 		HTTPStatusCounts:        map[string]int{},
@@ -263,6 +314,12 @@ func detectSegments(ride recording.Recording, settings recording.Settings) ([]se
 	detection.ExpectedSegments = &segmentCount
 	detection.DetectedSegments = segmentCount
 	segments, stops := labelRuns(ride.Start.RouteStations, result.Runs, ride.EndMS(), ride.Samples)
+	for index, segment := range segments {
+		segments[index].udpStats = udpStatsBetween(ride.UDPProbes, segment.DepartTMS, segment.ArriveTMS)
+	}
+	for index, stop := range stops {
+		stops[index].udpStats = udpStatsBetween(ride.UDPProbes, stop.StartTMS, stop.EndTMS)
+	}
 	return segments, stops, detection
 }
 
@@ -382,6 +439,13 @@ func printSummary(s summary) {
 	if s.RTTMinMS != nil {
 		fmt.Printf("  rtt ms: min %d, p50 %d, p95 %d, max %d\n", *s.RTTMinMS, *s.RTTP50MS, *s.RTTP95MS, *s.RTTMaxMS)
 	}
+	if s.UDPRequests > 0 {
+		fmt.Printf("  udp (STUN, %s): %d requests, %d replies (%.1f%% lost)", s.UDPProbeServer, s.UDPRequests, s.UDPReplies, pct(s.UDPRequests-s.UDPReplies, s.UDPRequests))
+		if s.UDPRTTP50MS != nil {
+			fmt.Printf(", rtt ms p50 %d, p95 %d", *s.UDPRTTP50MS, *s.UDPRTTP95MS)
+		}
+		fmt.Println()
+	}
 	if detection := s.StopDetection; detection != nil {
 		fmt.Printf("  stop detection: %s (segments %d, tunnel gaps without service %d)\n", detection.Status, detection.DetectedSegments, detection.TunnelGaps)
 		if detection.Marks > 0 {
@@ -394,25 +458,27 @@ func printSummary(s summary) {
 	if len(s.Segments) > 0 {
 		fmt.Printf("  segments: %d\n", len(s.Segments))
 		for i, seg := range s.Segments {
-			fmt.Printf("    %2d) %s -> %s (%ds) probe ok %.1f%%\n",
+			fmt.Printf("    %2d) %s -> %s (%ds) probe ok %.1f%%%s\n",
 				i+1,
 				coalesce(coalesce(seg.FromStationName, seg.FromStationID), "?"),
 				coalesce(coalesce(seg.ToStationName, seg.ToStationID), "?"),
 				int(seg.DurationMS/1000),
 				pct(seg.ProbeOK, seg.Samples),
+				udpLossText(seg.udpStats),
 			)
 		}
 	}
 	if len(s.Stops) > 0 {
 		fmt.Printf("  stops: %d\n", len(s.Stops))
 		for index, stop := range s.Stops {
-			fmt.Printf("    %2d) %s at %ds for %ds, probe ok %d of %d\n",
+			fmt.Printf("    %2d) %s at %ds for %ds, probe ok %d of %d%s\n",
 				index+1,
 				coalesce(stop.StationName, "?"),
 				stop.StartTMS/1000,
 				stop.DurationMS/1000,
 				stop.ProbeOK,
 				stop.Samples,
+				udpLossText(stop.udpStats),
 			)
 		}
 	}

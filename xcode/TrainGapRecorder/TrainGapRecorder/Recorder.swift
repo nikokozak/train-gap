@@ -9,7 +9,7 @@ import Synchronization
 import UIKit
 
 /// Records one subway ride as an NDJSON file of raw evidence: a network probe every second,
-/// the network path, and accelerometer readings. It does not label stations during the ride.
+/// UDP (STUN) requests five times a second, the network path, and accelerometer readings. It does not label stations during the ride.
 /// `cmd/recording-summarize` finds the stops in the motion trace after the ride and labels them
 /// from the start and end stations, so the rider has no tap to forget.
 @MainActor
@@ -50,6 +50,7 @@ final class Recorder: ObservableObject {
     /// Recent probe results, oldest first: true when the probe got through.
     @Published private(set) var serviceHistory: [Bool] = []
     @Published private(set) var lastSample: RecorderSample?
+    @Published private(set) var lastUDPProbe: RecorderUDPProbe?
     /// `clockSeconds()` when the last sample reached the file. The UI shows "saved N s ago" from it.
     @Published private(set) var lastSavedSampleTime: TimeInterval?
     /// Accelerometer readings in the last one-second batch. 0 means motion is not being recorded.
@@ -83,6 +84,7 @@ final class Recorder: ObservableObject {
     private let locationManager = CLLocationManager()
     private var backgroundActivitySession: CLBackgroundActivitySession?
     private let telephonyInfo = CTTelephonyNetworkInfo()
+    private let stunProber = StunProber()
 
     private struct ProbeBackoffState {
         var backoffUntilTime: TimeInterval
@@ -137,6 +139,7 @@ final class Recorder: ObservableObject {
         lastMark = nil
         serviceHistory = []
         lastSample = nil
+        lastUDPProbe = nil
         lastSavedSampleTime = nil
         motionReadingsPerSecond = 0
         probeCursor = 0
@@ -144,6 +147,7 @@ final class Recorder: ObservableObject {
         isRecording = true
 
         startPathMonitor()
+        stunProber.start()
         startMotionUpdates()
         startLocationKeepAlive()
         refreshStatus()
@@ -245,6 +249,7 @@ final class Recorder: ObservableObject {
 
     private func tick() {
         startProbe()
+        startUDPProbe()
         if let motionEvent = takeMotionBatch() {
             Task { await write(motionEvent) }
         }
@@ -287,6 +292,7 @@ final class Recorder: ObservableObject {
             sampleCount += 1
             if probe.ok {
                 probeOKCount += 1
+                stunProber.restartIfStuck()
             }
             let hadService = serviceHistory.last
             serviceHistory = Array((serviceHistory + [probe.ok]).suffix(Self.serviceHistoryLength))
@@ -295,6 +301,19 @@ final class Recorder: ObservableObject {
             if hadService != probe.ok {
                 await updateActivity()
             }
+        }
+    }
+
+    /// Starts one burst of STUN requests over the next tick and writes it when the last reply is
+    /// due. Bursts overlap, like the HTTPS probes.
+    private func startUDPProbe() {
+        let startTMS = nowTMS()
+        Task {
+            let roundTripsMS = await stunProber.measure(over: Self.tickInterval)
+            let intervalMS = Int((Self.tickInterval / Double(StunProber.requestsPerTick) * 1000).rounded())
+            let udpProbe = RecorderUDPProbe(tMS: startTMS, intervalMS: intervalMS, rttMS: roundTripsMS)
+            guard await write(udpProbe) else { return }
+            lastUDPProbe = udpProbe
         }
     }
 
@@ -487,6 +506,7 @@ final class Recorder: ObservableObject {
         pathMonitor?.cancel()
         pathMonitor = nil
         currentPath = nil
+        stunProber.stop()
         motionManager.stopDeviceMotionUpdates()
         locationManager.stopUpdatingLocation()
         locationManager.allowsBackgroundLocationUpdates = false
@@ -600,6 +620,7 @@ final class Recorder: ObservableObject {
             carrier: config.carrier,
             // Ask the sensor directly: this event is written before motion updates start.
             motionHz: motionManager.isDeviceMotionAvailable ? Self.motionHz : nil,
+            udpProbeServer: StunProber.serverDescription,
             routeStations: routeStations,
             linesDataset: dataset,
             device: device

@@ -11,6 +11,7 @@
     { "$ref": "#/$defs/undo" },
     { "$ref": "#/$defs/sample" },
     { "$ref": "#/$defs/motion" },
+    { "$ref": "#/$defs/udp_probe" },
     { "$ref": "#/$defs/mark" },
     { "$ref": "#/$defs/session_end" }
   ],
@@ -41,6 +42,7 @@
         "sample_interval_at_station_ms": { "type": "integer", "minimum": 100, "maximum": 60000 },
         "carrier": { "type": "string", "$comment": "Chosen by the rider. iOS no longer reports the carrier name." },
         "motion_hz": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "udp_probe_server": { "type": "string", "$comment": "host:port of the STUN server that udp_probe events measure. Absent in recordings before 2026-10-14." },
         "route_stations": {
           "$comment": "Stations in ride order, from the start station to the terminal. Stop labels come from it, so the recording can be processed without the app's station dataset.",
           "type": "array",
@@ -186,6 +188,18 @@
         "y_mg": { "type": "array", "items": { "type": "integer" } },
         "z_mg": { "type": "array", "items": { "type": "integer" } },
         "gravity_mg": { "type": "array", "items": { "type": "integer" }, "minItems": 3, "maxItems": 3 }
+      },
+      "additionalProperties": false
+    },
+    "udp_probe": {
+      "$comment": "One tick of STUN Binding requests (RFC 8489), sent interval_ms apart from t_ms. Each rtt_ms entry is one request: its round trip in milliseconds, or null when no reply came within 2 s (lost). Recordings before 2026-10-14 have none.",
+      "type": "object",
+      "required": ["type", "t_ms", "interval_ms", "rtt_ms"],
+      "properties": {
+        "type": { "const": "udp_probe" },
+        "t_ms": { "type": "integer", "minimum": 0 },
+        "interval_ms": { "type": "integer", "minimum": 1 },
+        "rtt_ms": { "type": "array", "items": { "type": ["integer", "null"], "minimum": 0 } }
       },
       "additionalProperties": false
     },

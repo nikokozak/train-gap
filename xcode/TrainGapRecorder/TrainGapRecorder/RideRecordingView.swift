@@ -159,6 +159,9 @@ struct RideRecordingView: View {
                 DetailRow(name: "Path", value: "\(sample.path.status) \(sample.path.interface ?? "") \(sample.path.radio ?? "")")
                 DetailRow(name: "Last probe", value: probeText(sample.probe))
             }
+            if let udpProbe = recorder.lastUDPProbe {
+                DetailRow(name: "UDP", value: udpText(udpProbe))
+            }
         }
         .font(.callout)
     }
@@ -251,6 +254,13 @@ struct RideRecordingView: View {
         // No sample yet: stale only once the first probe should have finished.
         let elapsed = recorder.startedAt.map { now.timeIntervalSince($0) } ?? 0
         return elapsed > Recorder.staleSampleAge
+    }
+
+    /// "4 of 5 replies · slowest 38 ms".
+    private func udpText(_ udpProbe: RecorderUDPProbe) -> String {
+        let roundTripsMS = udpProbe.rttMS.compactMap { $0 }
+        let slowest = roundTripsMS.max().map { " · slowest \($0) ms" } ?? ""
+        return "\(roundTripsMS.count) of \(udpProbe.rttMS.count) replies\(slowest)"
     }
 
     private func probeText(_ probe: ProbeSnapshot) -> String {

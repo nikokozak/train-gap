@@ -29,8 +29,9 @@ In the recorder app:
 ## What’s in the NDJSON
 
 One event per line. `t_ms` is milliseconds since the session started. The clock keeps counting while the phone sleeps, so time the app did not run shows as a gap in the data.
-- `session_start`: route, start station, the stations in ride order (`route_stations`), carrier, probe URLs, motion rate
+- `session_start`: route, start station, the stations in ride order (`route_stations`), carrier, probe URLs, STUN server (`udp_probe_server`), motion rate
 - `sample`: one network probe per second, plus network path and radio type (LTE, NR)
+- `udp_probe`: one second of UDP requests (see below)
 - `motion`: one second of accelerometer readings (20 Hz, milli-g, gravity removed)
 - `mark`: the rider tapped Station (`"kind": "station"`) or Anomaly (`"kind": "anomaly"`). Recordings before 2026-10-14 have no `kind`: a station mark.
 - `session_end`: Stop time, end station (absent for "Not sure"), and a summary
@@ -46,6 +47,16 @@ Each `sample` includes an HTTP probe:
 - If an endpoint returns **HTTP 429**, it is recorded as `probe.error="rate_limited"` and that URL is temporarily backed off.
 - Only transport failures and timeouts (4 s) result in `probe.ok=false`.
 - `reused_connection=false` means `rtt_ms` includes DNS, TCP, and TLS setup, for example the first probe after a blackout.
+
+### UDP probe (packet loss)
+
+The HTTP probe goes over TCP, which resends lost packets, so it shows delay but not loss. Calls, voice, and games feel the loss. The recorder also sends a STUN Binding request (the small "what is my address" request that WebRTC uses) to `stun.cloudflare.com:3478` five times a second:
+- Each `udp_probe` event has the requests of one second, `interval_ms` (200) apart from `t_ms`. `rtt_ms` has one entry per request: the round trip, or `null` when no reply came within 2 s.
+- A request is also lost when the phone has no network path at all. The recorder does not queue it.
+- If 10 requests in a row are lost while the HTTP probe gets through, the recorder opens a new UDP flow. After a tunnel, the carrier can give the phone a new address.
+- The summary shows the loss and round trips for the ride, each segment, and each stop. Recordings before 2026-10-14 have no UDP probe.
+
+The STUN server sees the phone's public address, as the HTTP probe URLs do. Its reply contains that address; the recorder does not save it.
 
 ## Summarize a recording
 
